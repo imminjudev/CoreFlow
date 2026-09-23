@@ -15,6 +15,7 @@ add_executable(CoreFlow
     src/core/CoreUniqueLock.hpp
     src/core/CoreConditionVariable.hpp
     src/core/CoreBlockingQueue.hpp
+    src/core/CoreDeque.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE

@@ -1,94 +1,82 @@
-#include <chrono>
 #include <iostream>
-#include <thread>
 
-#include "runtime/CoreThreadPool.hpp"
+#include "core/CoreDeque.hpp"
 
 
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.6 ===\n\n";
+        << "=== CoreDeque Test ===\n\n";
 
 
-    CoreThreadPool pool(2);
+    CoreDeque<int> deque;
 
 
-    // -----------------------------------------------------
-    // Worker를 먼저 실행한다.
-    //
-    // 아직 Task가 하나도 없으므로
-    // 두 Worker 모두 Blocking Queue에서 잠든다.
-    // -----------------------------------------------------
-    pool.start();
+    deque.pushBack(10);
+    deque.pushBack(20);
+    deque.pushBack(30);
 
 
     std::cout
-        << "[MAIN] Thread pool started\n";
+        << "Size: "
+        << deque.size()
+        << '\n';
 
 
-    // Worker가 실제로 기다리는 모습을 보기 위해
-    // 잠깐 기다린다.
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(500)
-    );
+    int value;
 
 
-    std::cout
-        << "\n[MAIN] Submitting first tasks\n";
+    // 뒤에서 꺼냄
+    if (deque.tryPopBack(value))
+    {
+        std::cout
+            << "Pop Back: "
+            << value
+            << '\n';
+    }
 
 
-    pool.submit(
-        {1, "Compile", 1000}
-    );
-
-    pool.submit(
-        {2, "Physics", 600}
-    );
-
-
-    // 실행 도중 새 Task가 들어오는 상황
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(500)
-    );
+    // 앞에서 꺼냄
+    if (deque.tryPopFront(value))
+    {
+        std::cout
+            << "Pop Front: "
+            << value
+            << '\n';
+    }
 
 
-    std::cout
-        << "\n[MAIN] Submitting more tasks\n";
+    deque.pushFront(5);
 
 
-    pool.submit(
-        {3, "AI", 800}
-    );
-
-    pool.submit(
-        {4, "Audio", 400}
-    );
-
-    pool.submit(
-        {5, "Render", 1200}
-    );
-
-
-    // -----------------------------------------------------
-    // 이제 더 이상 Task를 제출하지 않는다.
-    //
-    // Queue를 닫는다.
-    //
-    // 기존 Queue에 남은 Task는 전부 처리한다.
-    // -----------------------------------------------------
-    std::cout
-        << "\n[MAIN] Shutting down pool\n";
-
-    pool.shutdown();
-
-
-    // Worker가 남은 Task를 모두 끝낼 때까지 기다린다.
-    pool.wait();
+    if (deque.tryPopFront(value))
+    {
+        std::cout
+            << "Pop Front: "
+            << value
+            << '\n';
+    }
 
 
     std::cout
-        << "\nAll tasks completed.\n";
+        << "Remaining Size: "
+        << deque.size()
+        << '\n';
+
+
+    if (deque.tryPopBack(value))
+    {
+        std::cout
+            << "Pop Back: "
+            << value
+            << '\n';
+    }
+
+
+    std::cout
+        << "Final Size: "
+        << deque.size()
+        << '\n';
 
 
     return 0;
