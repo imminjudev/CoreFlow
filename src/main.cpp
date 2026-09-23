@@ -3,12 +3,13 @@
 #include <iostream>
 #include <thread>
 
-#include "core/CoreLockGuard.hpp"
-#include "core/CoreQueue.hpp"
-#include "core/CoreSpinLock.hpp"
+#include "core/CoreThreadSafeQueue.hpp"
 #include "runtime/Task.hpp"
 
 
+// ---------------------------------------------------------
+// Task 실행 함수
+// ---------------------------------------------------------
 void executeTask(int workerId, const Task& task)
 {
     std::cout
@@ -35,10 +36,18 @@ void executeTask(int workerId, const Task& task)
 }
 
 
+// ---------------------------------------------------------
+// Worker Thread
+//
+// 이제 Worker는
+// CoreSpinLock이나 CoreLockGuard를 전혀 알 필요가 없다.
+//
+// CoreThreadSafeQueue가 내부적으로
+// Queue 접근을 동기화한다.
+// ---------------------------------------------------------
 void worker(
     int workerId,
-    CoreQueue<Task>& taskQueue,
-    CoreSpinLock& queueLock
+    CoreThreadSafeQueue<Task>& taskQueue
 )
 {
     std::cout
@@ -50,17 +59,8 @@ void worker(
     {
         Task task;
 
-        bool hasTask = false;
-
-        // 이 블록 안에 들어오면 lock()
-        // 블록을 벗어나면 자동으로 unlock()
-        {
-            CoreLockGuard<CoreSpinLock> guard(queueLock);
-
-            hasTask = taskQueue.tryPop(task);
-        }
-
-        if (!hasTask)
+        // Thread-safe Queue에서 Task 하나를 꺼낸다.
+        if (!taskQueue.tryPop(task))
         {
             break;
         }
@@ -81,13 +81,30 @@ void worker(
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.3 ===\n\n";
-
-    CoreQueue<Task> taskQueue;
-
-    CoreSpinLock queueLock;
+        << "=== CoreFlow v0.4 ===\n\n";
 
 
+    // -----------------------------------------------------
+    // Thread-Safe Task Queue
+    //
+    // 내부 구조:
+    //
+    // CoreThreadSafeQueue
+    //      |
+    //      +-- CoreQueue
+    //      |
+    //      +-- CoreSpinLock
+    //      |
+    //      +-- CoreLockGuard
+    //
+    // main.cpp에서는 이 내부 구현을 몰라도 된다.
+    // -----------------------------------------------------
+    CoreThreadSafeQueue<Task> taskQueue;
+
+
+    // -----------------------------------------------------
+    // Task 등록
+    // -----------------------------------------------------
     taskQueue.push(
         {1, "Compile", 1000}
     );
@@ -115,29 +132,41 @@ int main()
         << " tasks submitted\n\n";
 
 
+    // -----------------------------------------------------
+    // 실행 시간 측정 시작
+    // -----------------------------------------------------
     auto start =
         std::chrono::steady_clock::now();
 
 
+    // -----------------------------------------------------
+    // Worker Thread 2개 생성
+    //
+    // 두 Worker가 같은 Thread-Safe Queue를 공유한다.
+    // -----------------------------------------------------
     std::thread worker0(
         worker,
         0,
-        std::ref(taskQueue),
-        std::ref(queueLock)
+        std::ref(taskQueue)
     );
 
     std::thread worker1(
         worker,
         1,
-        std::ref(taskQueue),
-        std::ref(queueLock)
+        std::ref(taskQueue)
     );
 
 
+    // -----------------------------------------------------
+    // 모든 Worker 종료 대기
+    // -----------------------------------------------------
     worker0.join();
     worker1.join();
 
 
+    // -----------------------------------------------------
+    // 실행 시간 측정 종료
+    // -----------------------------------------------------
     auto end =
         std::chrono::steady_clock::now();
 
@@ -154,6 +183,7 @@ int main()
 
     std::cout
         << "\nAll tasks completed.\n";
+
 
     return 0;
 }

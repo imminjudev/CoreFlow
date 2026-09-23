@@ -10,6 +10,7 @@ add_executable(CoreFlow
     src/runtime/Task.hpp
     src/core/CoreSpinLock.hpp
     src/core/CoreLockGuard.hpp
+    src/core/CoreThreadSafeQueue.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE
