@@ -1,0 +1,30 @@
+# CMake build
+build/
+out/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# VS Code local settings
+.vscode/
+
+# Compiled files
+*.exe
+*.obj
+*.lib
+*.dll
+*.pdb
+*.ilk
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# OS files
+.DS_Store
+Thumbs.db
