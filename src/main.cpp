@@ -1,5 +1,6 @@
 #include <chrono>
 #include <iostream>
+#include <thread>
 
 #include "runtime/CoreThreadPool.hpp"
 
@@ -7,21 +8,36 @@
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.5 ===\n\n";
+        << "=== CoreFlow v0.6 ===\n\n";
 
 
-    // -----------------------------------------------------
-    // Worker 2개를 가진 Thread Pool 생성
-    // -----------------------------------------------------
     CoreThreadPool pool(2);
 
 
     // -----------------------------------------------------
-    // Task 제출
+    // Worker를 먼저 실행한다.
     //
-    // 아직 v0.5에서는 Worker 시작 전에
-    // 모든 Task를 Queue에 넣는다.
+    // 아직 Task가 하나도 없으므로
+    // 두 Worker 모두 Blocking Queue에서 잠든다.
     // -----------------------------------------------------
+    pool.start();
+
+
+    std::cout
+        << "[MAIN] Thread pool started\n";
+
+
+    // Worker가 실제로 기다리는 모습을 보기 위해
+    // 잠깐 기다린다.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(500)
+    );
+
+
+    std::cout
+        << "\n[MAIN] Submitting first tasks\n";
+
+
     pool.submit(
         {1, "Compile", 1000}
     );
@@ -29,6 +45,17 @@ int main()
     pool.submit(
         {2, "Physics", 600}
     );
+
+
+    // 실행 도중 새 Task가 들어오는 상황
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(500)
+    );
+
+
+    std::cout
+        << "\n[MAIN] Submitting more tasks\n";
+
 
     pool.submit(
         {3, "AI", 800}
@@ -43,45 +70,22 @@ int main()
     );
 
 
+    // -----------------------------------------------------
+    // 이제 더 이상 Task를 제출하지 않는다.
+    //
+    // Queue를 닫는다.
+    //
+    // 기존 Queue에 남은 Task는 전부 처리한다.
+    // -----------------------------------------------------
     std::cout
-        << "[MAIN] "
-        << pool.pendingTaskCount()
-        << " tasks submitted\n\n";
+        << "\n[MAIN] Shutting down pool\n";
+
+    pool.shutdown();
 
 
-    // -----------------------------------------------------
-    // 실행 시간 측정 시작
-    // -----------------------------------------------------
-    auto start =
-        std::chrono::steady_clock::now();
-
-
-    // Worker Thread 시작
-    pool.start();
-
-
-    // 모든 Worker 종료 대기
+    // Worker가 남은 Task를 모두 끝낼 때까지 기다린다.
     pool.wait();
 
-
-    // -----------------------------------------------------
-    // 실행 시간 측정 종료
-    // -----------------------------------------------------
-    auto end =
-        std::chrono::steady_clock::now();
-
-    auto elapsed =
-        std::chrono::duration_cast<
-            std::chrono::milliseconds
-        >(
-            end - start
-        );
-
-
-    std::cout
-        << "\nExecution time: "
-        << elapsed.count()
-        << " ms\n";
 
     std::cout
         << "\nAll tasks completed.\n";

@@ -12,6 +12,9 @@ add_executable(CoreFlow
     src/core/CoreLockGuard.hpp
     src/core/CoreThreadSafeQueue.hpp
     src/runtime/CoreThreadPool.cpp
+    src/core/CoreUniqueLock.hpp
+    src/core/CoreConditionVariable.hpp
+    src/core/CoreBlockingQueue.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE
