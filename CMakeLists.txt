@@ -16,6 +16,8 @@ add_executable(CoreFlow
     src/core/CoreConditionVariable.hpp
     src/core/CoreBlockingQueue.hpp
     src/core/CoreDeque.hpp
+    src/core/CoreBlockingDeque.hpp
+    src/runtime/WorkerState.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE

@@ -1,20 +1,26 @@
 #pragma once
 
 #include <cstddef>
-#include <thread>
 
-#include "core/CoreBlockingQueue.hpp"
+#include "core/CoreLockGuard.hpp"
+#include "core/CoreSpinLock.hpp"
 #include "runtime/Task.hpp"
+#include "runtime/WorkerState.hpp"
 
 
 class CoreThreadPool
 {
 private:
-    std::thread* m_workers;
+    WorkerState* m_workers;
 
     std::size_t m_workerCount;
 
-    CoreBlockingQueue<Task> m_taskQueue;
+    // 다음 Task를 어느 Worker에게 줄지 결정
+    std::size_t m_nextWorker;
+
+    // submit()이 여러 Thread에서 호출될 경우
+    // m_nextWorker 보호용
+    CoreSpinLock m_submitLock;
 
     bool m_started;
 

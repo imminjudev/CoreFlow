@@ -1,82 +1,101 @@
+#include <chrono>
 #include <iostream>
 
-#include "core/CoreDeque.hpp"
+#include "runtime/CoreThreadPool.hpp"
 
 
 int main()
 {
     std::cout
-        << "=== CoreDeque Test ===\n\n";
+        << "=== CoreFlow v0.8 ===\n\n";
 
 
-    CoreDeque<int> deque;
+    CoreThreadPool pool(2);
 
 
-    deque.pushBack(10);
-    deque.pushBack(20);
-    deque.pushBack(30);
+    // Worker 먼저 실행
+    pool.start();
 
 
-    std::cout
-        << "Size: "
-        << deque.size()
-        << '\n';
+    auto start =
+        std::chrono::steady_clock::now();
 
 
-    int value;
+    // -----------------------------------------------------
+    // Round-Robin으로 분배된다.
+    //
+    // Worker 0:
+    // T1 = 1000
+    // T3 = 800
+    // T5 = 1200
+    //
+    // 총 3000ms
+    //
+    // Worker 1:
+    // T2 = 600
+    // T4 = 400
+    //
+    // 총 1000ms
+    //
+    // Work Stealing이 없기 때문에
+    // Worker 1이 먼저 놀게 될 것이다.
+    // -----------------------------------------------------
 
+    pool.submit(
+        {1, "Compile", 1000}
+    );
 
-    // 뒤에서 꺼냄
-    if (deque.tryPopBack(value))
-    {
-        std::cout
-            << "Pop Back: "
-            << value
-            << '\n';
-    }
+    pool.submit(
+        {2, "Physics", 600}
+    );
 
+    pool.submit(
+        {3, "AI", 800}
+    );
 
-    // 앞에서 꺼냄
-    if (deque.tryPopFront(value))
-    {
-        std::cout
-            << "Pop Front: "
-            << value
-            << '\n';
-    }
+    pool.submit(
+        {4, "Audio", 400}
+    );
 
-
-    deque.pushFront(5);
-
-
-    if (deque.tryPopFront(value))
-    {
-        std::cout
-            << "Pop Front: "
-            << value
-            << '\n';
-    }
-
-
-    std::cout
-        << "Remaining Size: "
-        << deque.size()
-        << '\n';
-
-
-    if (deque.tryPopBack(value))
-    {
-        std::cout
-            << "Pop Back: "
-            << value
-            << '\n';
-    }
+    pool.submit(
+        {5, "Render", 1200}
+    );
 
 
     std::cout
-        << "Final Size: "
-        << deque.size()
-        << '\n';
+        << "\n[MAIN] "
+        << pool.pendingTaskCount()
+        << " tasks waiting\n\n";
+
+
+    // 새 Task 제출 종료
+    pool.shutdown();
+
+
+    // 기존 Task 처리 완료까지 기다림
+    pool.wait();
+
+
+    auto end =
+        std::chrono::steady_clock::now();
+
+
+    auto elapsed =
+        std::chrono::duration_cast<
+            std::chrono::milliseconds
+        >(
+            end - start
+        );
+
+
+    std::cout
+        << "\nExecution time: "
+        << elapsed.count()
+        << " ms\n";
+
+
+    std::cout
+        << "\nAll tasks completed.\n";
 
 
     return 0;

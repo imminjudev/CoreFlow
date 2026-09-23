@@ -9,12 +9,22 @@ CoreThreadPool::CoreThreadPool(
 )
     : m_workers(nullptr),
       m_workerCount(workerCount),
+      m_nextWorker(0),
       m_started(false)
 {
     if (m_workerCount > 0)
     {
         m_workers =
-            new std::thread[m_workerCount];
+            new WorkerState[m_workerCount];
+
+        for (
+            std::size_t i = 0;
+            i < m_workerCount;
+            i++
+        )
+        {
+            m_workers[i].id = i;
+        }
     }
 }
 
@@ -34,20 +44,68 @@ CoreThreadPool::~CoreThreadPool()
 
 
 // ---------------------------------------------------------
-// Task 제출
+// submit
 //
-// 이제 start() 이후에도 Task를 넣을 수 있다.
+// Round-Robin 방식으로 Task를 Worker에게 분배한다.
+//
+// Worker 2개라면:
+//
+// T1 -> W0
+// T2 -> W1
+// T3 -> W0
+// T4 -> W1
+// T5 -> W0
 // ---------------------------------------------------------
 bool CoreThreadPool::submit(
     const Task& task
 )
 {
-    return m_taskQueue.push(task);
+    if (m_workerCount == 0)
+    {
+        return false;
+    }
+
+
+    std::size_t targetWorker;
+
+
+    {
+        CoreLockGuard<CoreSpinLock> guard(
+            m_submitLock
+        );
+
+        targetWorker =
+            m_nextWorker;
+
+        m_nextWorker =
+            (m_nextWorker + 1)
+            % m_workerCount;
+    }
+
+
+    bool success =
+        m_workers[targetWorker]
+            .localQueue
+            .pushBack(task);
+
+
+    if (success)
+    {
+        std::cout
+            << "[SCHEDULER] Task "
+            << task.id
+            << " -> Worker "
+            << targetWorker
+            << '\n';
+    }
+
+
+    return success;
 }
 
 
 // ---------------------------------------------------------
-// Worker 시작
+// Worker Thread 시작
 // ---------------------------------------------------------
 void CoreThreadPool::start()
 {
@@ -58,13 +116,14 @@ void CoreThreadPool::start()
 
     m_started = true;
 
+
     for (
         std::size_t i = 0;
         i < m_workerCount;
         i++
     )
     {
-        m_workers[i] =
+        m_workers[i].thread =
             std::thread(
                 &CoreThreadPool::workerLoop,
                 this,
@@ -75,23 +134,27 @@ void CoreThreadPool::start()
 
 
 // ---------------------------------------------------------
-// shutdown
+// 모든 Local Queue를 close.
 //
-// 더 이상 Task를 받지 않는다.
-//
-// Queue에 남아 있는 기존 Task는 Worker들이
-// 끝까지 처리한다.
-//
-// 모든 Task가 처리되면 Worker가 종료된다.
+// Queue에 남아있는 Task는 끝까지 처리한다.
 // ---------------------------------------------------------
 void CoreThreadPool::shutdown()
 {
-    m_taskQueue.close();
+    for (
+        std::size_t i = 0;
+        i < m_workerCount;
+        i++
+    )
+    {
+        m_workers[i]
+            .localQueue
+            .close();
+    }
 }
 
 
 // ---------------------------------------------------------
-// 모든 Worker 종료 대기
+// Worker 종료 대기
 // ---------------------------------------------------------
 void CoreThreadPool::wait()
 {
@@ -100,17 +163,25 @@ void CoreThreadPool::wait()
         return;
     }
 
+
     for (
         std::size_t i = 0;
         i < m_workerCount;
         i++
     )
     {
-        if (m_workers[i].joinable())
+        if (
+            m_workers[i]
+                .thread
+                .joinable()
+        )
         {
-            m_workers[i].join();
+            m_workers[i]
+                .thread
+                .join();
         }
     }
+
 
     m_started = false;
 }
@@ -119,13 +190,13 @@ void CoreThreadPool::wait()
 // ---------------------------------------------------------
 // Worker Loop
 //
-// Queue가 비었다고 종료하지 않는다.
+// Worker는 자기 Local Queue만 본다.
 //
-// waitPop() 내부에서 잠들었다가
-// 새로운 Task가 들어오면 깨어난다.
+// 현재 v0.8에는 Work Stealing이 없다.
 //
-// Queue가 close되고
-// 남은 Task도 없을 때만 false를 반환한다.
+// 자신의 Queue가 비어 있으면 기다린다.
+//
+// shutdown 후 자신의 Queue까지 완전히 비면 종료한다.
 // ---------------------------------------------------------
 void CoreThreadPool::workerLoop(
     std::size_t workerId
@@ -136,20 +207,32 @@ void CoreThreadPool::workerLoop(
         << workerId
         << "] started\n";
 
+
+    WorkerState& worker =
+        m_workers[workerId];
+
+
     while (true)
     {
         Task task{};
 
-        if (!m_taskQueue.waitPop(task))
+
+        if (
+            !worker
+                .localQueue
+                .waitPopBack(task)
+        )
         {
             break;
         }
+
 
         executeTask(
             workerId,
             task
         );
     }
+
 
     std::cout
         << "[Worker "
@@ -158,6 +241,9 @@ void CoreThreadPool::workerLoop(
 }
 
 
+// ---------------------------------------------------------
+// Task 실행
+// ---------------------------------------------------------
 void CoreThreadPool::executeTask(
     std::size_t workerId,
     const Task& task
@@ -172,11 +258,13 @@ void CoreThreadPool::executeTask(
         << task.name
         << '\n';
 
+
     std::this_thread::sleep_for(
         std::chrono::milliseconds(
             task.durationMs
         )
     );
+
 
     std::cout
         << "[Worker "
@@ -189,8 +277,27 @@ void CoreThreadPool::executeTask(
 }
 
 
+// ---------------------------------------------------------
+// 모든 Local Queue에 남은 Task 수 합산
+// ---------------------------------------------------------
 std::size_t
 CoreThreadPool::pendingTaskCount()
 {
-    return m_taskQueue.size();
+    std::size_t total = 0;
+
+
+    for (
+        std::size_t i = 0;
+        i < m_workerCount;
+        i++
+    )
+    {
+        total +=
+            m_workers[i]
+                .localQueue
+                .size();
+    }
+
+
+    return total;
 }
