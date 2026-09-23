@@ -1,134 +1,51 @@
 #include <chrono>
-#include <functional>
 #include <iostream>
-#include <thread>
 
-#include "core/CoreThreadSafeQueue.hpp"
-#include "runtime/Task.hpp"
-
-
-// ---------------------------------------------------------
-// Task 실행 함수
-// ---------------------------------------------------------
-void executeTask(int workerId, const Task& task)
-{
-    std::cout
-        << "[Worker "
-        << workerId
-        << "] START Task "
-        << task.id
-        << " | "
-        << task.name
-        << '\n';
-
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(task.durationMs)
-    );
-
-    std::cout
-        << "[Worker "
-        << workerId
-        << "] END   Task "
-        << task.id
-        << " | "
-        << task.name
-        << '\n';
-}
-
-
-// ---------------------------------------------------------
-// Worker Thread
-//
-// 이제 Worker는
-// CoreSpinLock이나 CoreLockGuard를 전혀 알 필요가 없다.
-//
-// CoreThreadSafeQueue가 내부적으로
-// Queue 접근을 동기화한다.
-// ---------------------------------------------------------
-void worker(
-    int workerId,
-    CoreThreadSafeQueue<Task>& taskQueue
-)
-{
-    std::cout
-        << "[Worker "
-        << workerId
-        << "] started\n";
-
-    while (true)
-    {
-        Task task;
-
-        // Thread-safe Queue에서 Task 하나를 꺼낸다.
-        if (!taskQueue.tryPop(task))
-        {
-            break;
-        }
-
-        executeTask(
-            workerId,
-            task
-        );
-    }
-
-    std::cout
-        << "[Worker "
-        << workerId
-        << "] stopped\n";
-}
+#include "runtime/CoreThreadPool.hpp"
 
 
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.4 ===\n\n";
+        << "=== CoreFlow v0.5 ===\n\n";
 
 
     // -----------------------------------------------------
-    // Thread-Safe Task Queue
+    // Worker 2개를 가진 Thread Pool 생성
+    // -----------------------------------------------------
+    CoreThreadPool pool(2);
+
+
+    // -----------------------------------------------------
+    // Task 제출
     //
-    // 내부 구조:
-    //
-    // CoreThreadSafeQueue
-    //      |
-    //      +-- CoreQueue
-    //      |
-    //      +-- CoreSpinLock
-    //      |
-    //      +-- CoreLockGuard
-    //
-    // main.cpp에서는 이 내부 구현을 몰라도 된다.
+    // 아직 v0.5에서는 Worker 시작 전에
+    // 모든 Task를 Queue에 넣는다.
     // -----------------------------------------------------
-    CoreThreadSafeQueue<Task> taskQueue;
-
-
-    // -----------------------------------------------------
-    // Task 등록
-    // -----------------------------------------------------
-    taskQueue.push(
+    pool.submit(
         {1, "Compile", 1000}
     );
 
-    taskQueue.push(
+    pool.submit(
         {2, "Physics", 600}
     );
 
-    taskQueue.push(
+    pool.submit(
         {3, "AI", 800}
     );
 
-    taskQueue.push(
+    pool.submit(
         {4, "Audio", 400}
     );
 
-    taskQueue.push(
+    pool.submit(
         {5, "Render", 1200}
     );
 
 
     std::cout
         << "[MAIN] "
-        << taskQueue.size()
+        << pool.pendingTaskCount()
         << " tasks submitted\n\n";
 
 
@@ -139,29 +56,12 @@ int main()
         std::chrono::steady_clock::now();
 
 
-    // -----------------------------------------------------
-    // Worker Thread 2개 생성
-    //
-    // 두 Worker가 같은 Thread-Safe Queue를 공유한다.
-    // -----------------------------------------------------
-    std::thread worker0(
-        worker,
-        0,
-        std::ref(taskQueue)
-    );
-
-    std::thread worker1(
-        worker,
-        1,
-        std::ref(taskQueue)
-    );
+    // Worker Thread 시작
+    pool.start();
 
 
-    // -----------------------------------------------------
     // 모든 Worker 종료 대기
-    // -----------------------------------------------------
-    worker0.join();
-    worker1.join();
+    pool.wait();
 
 
     // -----------------------------------------------------
@@ -171,7 +71,9 @@ int main()
         std::chrono::steady_clock::now();
 
     auto elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration_cast<
+            std::chrono::milliseconds
+        >(
             end - start
         );
 
