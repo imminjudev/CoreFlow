@@ -20,6 +20,7 @@ CoreThreadPool::CoreThreadPool(
         m_workers =
             new WorkerState[m_workerCount];
 
+
         for (
             std::size_t i = 0;
             i < m_workerCount;
@@ -40,6 +41,7 @@ CoreThreadPool::~CoreThreadPool()
         wait();
     }
 
+
     delete[] m_workers;
 
     m_workers = nullptr;
@@ -49,7 +51,9 @@ CoreThreadPool::~CoreThreadPool()
 // ---------------------------------------------------------
 // submit
 //
-// Round-Robin으로 각 Worker의 Local Deque에 배치한다.
+// Round-Robin으로 Task를 Worker Local Deque에 배치.
+//
+// 성공하면 sleeping Worker 하나를 깨운다.
 // ---------------------------------------------------------
 bool CoreThreadPool::submit(
     const Task& task
@@ -59,6 +63,7 @@ bool CoreThreadPool::submit(
     {
         return false;
     }
+
 
     if (m_shutdownRequested.load())
     {
@@ -74,8 +79,10 @@ bool CoreThreadPool::submit(
             m_submitLock
         );
 
+
         targetWorker =
             m_nextWorker;
+
 
         m_nextWorker =
             (m_nextWorker + 1)
@@ -83,11 +90,10 @@ bool CoreThreadPool::submit(
     }
 
 
-    // Task가 Queue에 공개되기 전에
-    // remaining count를 먼저 증가시킨다.
+    // Queue에 Task가 공개되기 전에 먼저 증가.
     //
-    // 그렇지 않으면 Worker가 매우 빠르게 Task를 가져가서
-    // count 증가 전에 완료하는 race가 생길 수 있다.
+    // Worker가 매우 빠르게 Task를 가져가서
+    // 완료해버리는 race를 막기 위함.
     m_remainingTasks.fetch_add(1);
 
 
@@ -99,7 +105,6 @@ bool CoreThreadPool::submit(
 
     if (!success)
     {
-        // Queue가 이미 close된 경우 원상복구
         m_remainingTasks.fetch_sub(1);
 
         return false;
@@ -114,12 +119,19 @@ bool CoreThreadPool::submit(
         << '\n';
 
 
+    // -----------------------------------------------------
+    // Task가 생겼으므로
+    // 잠들어 있는 Worker 하나를 깨운다.
+    // -----------------------------------------------------
+    m_workSignal.notifyOne();
+
+
     return true;
 }
 
 
 // ---------------------------------------------------------
-// start
+// Worker 시작
 // ---------------------------------------------------------
 void CoreThreadPool::start()
 {
@@ -151,9 +163,9 @@ void CoreThreadPool::start()
 // ---------------------------------------------------------
 // shutdown
 //
-// 새로운 Task 제출을 막고 Local Queue들을 닫는다.
+// 이후 submit 차단.
 //
-// 이미 들어간 Task는 모두 실행한다.
+// Local Queue 안의 기존 Task는 끝까지 처리.
 // ---------------------------------------------------------
 void CoreThreadPool::shutdown()
 {
@@ -170,11 +182,16 @@ void CoreThreadPool::shutdown()
             .localQueue
             .close();
     }
+
+
+    // shutdown 상태가 바뀌었으므로
+    // 잠들어 있는 Worker 전부 깨움.
+    m_workSignal.notifyAll();
 }
 
 
 // ---------------------------------------------------------
-// wait
+// Worker 종료 대기
 // ---------------------------------------------------------
 void CoreThreadPool::wait()
 {
@@ -208,19 +225,10 @@ void CoreThreadPool::wait()
 
 
 // ---------------------------------------------------------
-// trySteal
+// Work Stealing
 //
-// 자기 Queue에 일이 없으면 다른 Worker들을 순서대로 확인한다.
-//
-// 다른 Worker의 FRONT에서 Task를 가져온다.
-//
-// Owner:
-//      popBack()
-//
-// Thief:
-//      popFront()
-//
-// 서로 반대쪽을 주로 사용하게 한다.
+// 자신의 Queue가 비어 있으면
+// 다른 Worker의 FRONT에서 Task를 훔친다.
 // ---------------------------------------------------------
 bool CoreThreadPool::trySteal(
     std::size_t thiefId,
@@ -263,12 +271,16 @@ bool CoreThreadPool::trySteal(
 
 
 // ---------------------------------------------------------
-// workerLoop
+// Worker Loop
 //
-// 1. 자기 Local Queue 뒤에서 Task 획득
-// 2. 없으면 다른 Worker Queue 앞에서 Steal
-// 3. 그래도 없으면 잠깐 CPU 실행권 양보
-// 4. shutdown + 모든 Task 완료 시 종료
+// v0.10 핵심:
+//
+// 1. Work Signal generation 기록
+// 2. Local Queue 확인
+// 3. 없으면 Steal
+// 4. Task 있으면 실행
+// 5. 아무것도 없으면 Sleep
+// 6. submit/shutdown으로 Wake
 // ---------------------------------------------------------
 void CoreThreadPool::workerLoop(
     std::size_t workerId
@@ -286,17 +298,30 @@ void CoreThreadPool::workerLoop(
 
     while (true)
     {
+        // -------------------------------------------------
+        // 작업 탐색 전에 현재 generation을 기억한다.
+        //
+        // 이것이 lost wake-up 방지의 핵심이다.
+        // -------------------------------------------------
+        std::size_t observedGeneration =
+            m_workSignal.snapshot();
+
+
         Task task{};
 
+
+        // -------------------------------------------------
+        // 1. 자기 Local Queue
+        // -------------------------------------------------
         bool hasTask =
             worker
                 .localQueue
                 .tryPopBack(task);
 
 
-        // ---------------------------------------------
-        // Local Queue가 비었다면 Steal 시도
-        // ---------------------------------------------
+        // -------------------------------------------------
+        // 2. Local Queue가 비었으면 Steal
+        // -------------------------------------------------
         if (!hasTask)
         {
             std::size_t victimId = 0;
@@ -325,9 +350,9 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // ---------------------------------------------
-        // Task 획득 성공
-        // ---------------------------------------------
+        // -------------------------------------------------
+        // Task 발견
+        // -------------------------------------------------
         if (hasTask)
         {
             executeTask(
@@ -336,17 +361,34 @@ void CoreThreadPool::workerLoop(
             );
 
 
-            // Task 하나 완전히 처리 완료
-            m_remainingTasks.fetch_sub(1);
+            // fetch_sub()는 감소하기 전 값을 반환한다.
+            std::size_t previousRemaining =
+                m_remainingTasks.fetch_sub(1);
+
+
+            // -------------------------------------------------
+            // 내가 마지막 Task를 끝낸 Worker라면
+            //
+            // shutdown 상태에서 잠들어 있는 다른 Worker들도
+            // 종료 조건을 확인할 수 있게 모두 깨운다.
+            // -------------------------------------------------
+            if (
+                previousRemaining == 1
+                &&
+                m_shutdownRequested.load()
+            )
+            {
+                m_workSignal.notifyAll();
+            }
 
 
             continue;
         }
 
 
-        // ---------------------------------------------
-        // 더 이상 Task가 없고 shutdown도 요청됐다면 종료
-        // ---------------------------------------------
+        // -------------------------------------------------
+        // shutdown 상태이며 모든 Task가 끝났다면 종료.
+        // -------------------------------------------------
         if (
             m_shutdownRequested.load()
             &&
@@ -357,12 +399,28 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // 아직 다른 Worker가 실행 중일 수도 있고,
-        // 앞으로 Task가 들어올 수도 있다.
+        // -------------------------------------------------
+        // 아무 일도 없음.
         //
-        // 지금 버전에서는 busy-spin을 줄이기 위해
-        // CPU 실행권을 다른 Thread에게 양보한다.
-        std::this_thread::yield();
+        // v0.9:
+        //     std::this_thread::yield();
+        //
+        // v0.10:
+        //     실제 Sleep.
+        //
+        // generation이 바뀌거나
+        // 전체 종료 조건이 만족될 때 깨어난다.
+        // -------------------------------------------------
+        m_workSignal.waitForChange(
+            observedGeneration,
+            [this]()
+            {
+                return
+                    m_shutdownRequested.load()
+                    &&
+                    m_remainingTasks.load() == 0;
+            }
+        );
     }
 
 
@@ -374,7 +432,7 @@ void CoreThreadPool::workerLoop(
 
 
 // ---------------------------------------------------------
-// executeTask
+// 실제 Task 실행
 // ---------------------------------------------------------
 void CoreThreadPool::executeTask(
     std::size_t workerId,
@@ -410,9 +468,9 @@ void CoreThreadPool::executeTask(
 
 
 // ---------------------------------------------------------
-// 각 Local Queue에 아직 들어있는 Task 개수
+// Queue 안에 아직 대기 중인 Task 개수.
 //
-// 실행 중인 Task는 포함하지 않는다.
+// 실행 중인 Task는 포함되지 않는다.
 // ---------------------------------------------------------
 std::size_t
 CoreThreadPool::pendingTaskCount()

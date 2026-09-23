@@ -1,5 +1,6 @@
 #include <chrono>
 #include <iostream>
+#include <thread>
 
 #include "runtime/CoreThreadPool.hpp"
 
@@ -7,7 +8,7 @@
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.9 ===\n\n";
+        << "=== CoreFlow v0.10 ===\n\n";
 
 
     CoreThreadPool pool(2);
@@ -16,24 +17,28 @@ int main()
     pool.start();
 
 
+    std::cout
+        << "[MAIN] Pool started with no tasks\n";
+
+
+    // -----------------------------------------------------
+    // Worker에게 할 일이 없는 상태.
+    //
+    // v0.10 Worker는 여기서 busy-loop를 돌지 않고
+    // Global Work Signal을 기다리며 Sleep한다.
+    // -----------------------------------------------------
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(1000)
+    );
+
+
+    std::cout
+        << "\n[MAIN] Submitting tasks\n";
+
+
     auto start =
         std::chrono::steady_clock::now();
 
-
-    // -----------------------------------------------------
-    // Round-Robin 초기 배치
-    //
-    // Worker 0
-    // T1 = 1000
-    // T3 = 800
-    // T5 = 1200
-    //
-    // Worker 1
-    // T2 = 600
-    // T4 = 400
-    //
-    // 초기 상태는 의도적으로 불균형하다.
-    // -----------------------------------------------------
 
     pool.submit(
         {1, "Compile", 1000}
