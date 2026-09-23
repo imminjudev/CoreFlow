@@ -7,13 +7,12 @@
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.8 ===\n\n";
+        << "=== CoreFlow v0.9 ===\n\n";
 
 
     CoreThreadPool pool(2);
 
 
-    // Worker 먼저 실행
     pool.start();
 
 
@@ -22,23 +21,18 @@ int main()
 
 
     // -----------------------------------------------------
-    // Round-Robin으로 분배된다.
+    // Round-Robin 초기 배치
     //
-    // Worker 0:
+    // Worker 0
     // T1 = 1000
     // T3 = 800
     // T5 = 1200
     //
-    // 총 3000ms
-    //
-    // Worker 1:
+    // Worker 1
     // T2 = 600
     // T4 = 400
     //
-    // 총 1000ms
-    //
-    // Work Stealing이 없기 때문에
-    // Worker 1이 먼저 놀게 될 것이다.
+    // 초기 상태는 의도적으로 불균형하다.
     // -----------------------------------------------------
 
     pool.submit(
@@ -68,11 +62,8 @@ int main()
         << " tasks waiting\n\n";
 
 
-    // 새 Task 제출 종료
     pool.shutdown();
 
-
-    // 기존 Task 처리 완료까지 기다림
     pool.wait();
 
 

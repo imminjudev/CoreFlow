@@ -99,6 +99,13 @@ public:
         return m_deque.tryPopFront(output);
     }
 
+    bool tryPopBack(T& output)
+    {
+        CoreLockGuard<CoreSpinLock> guard(m_lock);
+
+        return m_deque.tryPopBack(output);
+    }
+
     void close()
     {
         {
