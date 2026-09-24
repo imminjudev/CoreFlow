@@ -19,6 +19,8 @@ add_executable(CoreFlow
     src/core/CoreBlockingDeque.hpp
     src/runtime/WorkerState.hpp
     src/core/CoreWorkSignal.hpp
+    src/core/CoreStartBarrier.hpp
+    src/benchmark/BenchmarkWorkload.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE

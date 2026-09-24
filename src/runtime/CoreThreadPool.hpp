@@ -5,10 +5,31 @@
 
 #include "core/CoreLockGuard.hpp"
 #include "core/CoreSpinLock.hpp"
+#include "core/CoreStartBarrier.hpp"
 #include "core/CoreWorkSignal.hpp"
 
 #include "runtime/Task.hpp"
 #include "runtime/WorkerState.hpp"
+
+
+// ---------------------------------------------------------
+// CoreSchedulerStatistics
+//
+// Thread Pool 전체의 Scheduler 통계를
+// Benchmark 코드로 전달하기 위한 구조체.
+// ---------------------------------------------------------
+struct CoreSchedulerStatistics
+{
+    std::size_t executedTasks = 0;
+
+    std::size_t stolenTasks = 0;
+
+    std::size_t stealAttempts = 0;
+
+    std::size_t sleepCount = 0;
+
+    std::size_t wakeCount = 0;
+};
 
 
 class CoreThreadPool
@@ -24,17 +45,24 @@ private:
 
     bool m_started;
 
+    bool m_verbose;
 
-    // Queue 대기 + 실행 중인 모든 미완료 Task
+
+    // Queue에서 대기 중이거나
+    // 실행 중인 전체 미완료 Task
     std::atomic<std::size_t> m_remainingTasks;
 
 
-    // shutdown 이후 새로운 submit을 차단한다.
+    // shutdown 이후 Task 제출 차단
     std::atomic<bool> m_shutdownRequested;
 
 
-    // Sleeping Worker들을 깨우기 위한 Global Signal
+    // Idle Worker Sleep / Wake
     CoreWorkSignal m_workSignal;
+
+
+    // Benchmark 시작 시점 동기화
+    CoreStartBarrier m_startBarrier;
 
 
 private:
@@ -58,7 +86,8 @@ private:
 
 public:
     explicit CoreThreadPool(
-        std::size_t workerCount
+        std::size_t workerCount,
+        bool verbose = true
     );
 
 
@@ -82,6 +111,8 @@ public:
 
     void start();
 
+    void beginExecution();
+
     void shutdown();
 
     void wait();
@@ -90,7 +121,10 @@ public:
     std::size_t pendingTaskCount();
 
 
-    // 모든 Worker가 종료된 뒤
-    // Scheduler 실행 통계를 출력한다.
     void printStatistics() const;
+
+
+    // Benchmark에서 사용할 전체 통계 반환
+    CoreSchedulerStatistics
+        getStatistics() const;
 };
