@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 
@@ -7,24 +8,16 @@
 #include "runtime/CoreThreadPool.hpp"
 
 
-// ---------------------------------------------------------
-// SingleRunResult
-//
-// Benchmark 한 번의 결과.
-// ---------------------------------------------------------
 struct SingleRunResult
 {
     double elapsedMs;
 
     CoreSchedulerStatistics statistics;
+
+    std::uint64_t checksum;
 };
 
 
-// ---------------------------------------------------------
-// BenchmarkResult
-//
-// 동일한 Worker 수로 여러 번 실행한 결과.
-// ---------------------------------------------------------
 struct BenchmarkResult
 {
     std::size_t workerCount;
@@ -46,33 +39,28 @@ struct BenchmarkResult
 
 
 // ---------------------------------------------------------
-// runSingleBenchmark
-//
-// 하나의 Workload를 한 번 실행한다.
+// Benchmark 한 번 실행
 // ---------------------------------------------------------
 SingleRunResult runSingleBenchmark(
     std::size_t workerCount,
     const BenchmarkWorkload& workload
 )
 {
-    // Benchmark에서는 Runtime 로그 OFF
     CoreThreadPool pool(
         workerCount,
         false
     );
 
 
-    // Worker 생성 후 Start Barrier에서 대기
+    // Worker 생성 후 Barrier에서 대기
     pool.start();
 
 
-    // -----------------------------------------------------
-    // 모든 Task를 실행 전에 미리 배치한다.
-    // -----------------------------------------------------
     const Task* tasks =
         workload.tasks();
 
 
+    // Worker 실행 전에 모든 Task 배치
     for (
         std::size_t i = 0;
         i < workload.taskCount();
@@ -85,9 +73,7 @@ SingleRunResult runSingleBenchmark(
     }
 
 
-    // -----------------------------------------------------
-    // Scheduler 실행시간 측정 시작
-    // -----------------------------------------------------
+    // 실제 Scheduler 실행 구간
     auto start =
         std::chrono::steady_clock::now();
 
@@ -95,12 +81,9 @@ SingleRunResult runSingleBenchmark(
     pool.beginExecution();
 
 
-    // 모든 Task가 이미 제출됐으므로
-    // 추가 Task 제출 차단
     pool.shutdown();
 
 
-    // 모든 Worker 종료 대기
     pool.wait();
 
 
@@ -126,10 +109,12 @@ SingleRunResult runSingleBenchmark(
         / 1000.0;
 
 
-    // Worker 종료 이후이므로
-    // 통계를 안전하게 읽을 수 있다.
     result.statistics =
         pool.getStatistics();
+
+
+    result.checksum =
+        pool.computeChecksum();
 
 
     return result;
@@ -137,9 +122,7 @@ SingleRunResult runSingleBenchmark(
 
 
 // ---------------------------------------------------------
-// runBenchmark
-//
-// 같은 조건을 여러 번 반복한다.
+// 같은 조건 여러 번 반복
 // ---------------------------------------------------------
 BenchmarkResult runBenchmark(
     std::size_t workerCount,
@@ -174,6 +157,10 @@ BenchmarkResult runBenchmark(
         0;
 
 
+    std::uint64_t combinedChecksum =
+        0;
+
+
     for (
         std::size_t run = 0;
         run < runCount;
@@ -187,12 +174,17 @@ BenchmarkResult runBenchmark(
             );
 
 
+        combinedChecksum ^=
+            runResult.checksum;
+
+
         std::cout
             << "  Run "
             << (run + 1)
             << "/"
             << runCount
             << " : "
+
             << std::fixed
             << std::setprecision(3)
             << runResult.elapsedMs
@@ -293,8 +285,6 @@ BenchmarkResult runBenchmark(
         );
 
 
-    // 아래 두 값은
-    // 1 Worker Baseline이 계산된 뒤 채운다.
     result.speedup =
         0.0;
 
@@ -303,12 +293,23 @@ BenchmarkResult runBenchmark(
         0.0;
 
 
+    // CPU 계산 결과가 실제 프로그램에서
+    // 사용되고 있음을 확인하기 위한 값.
+    //
+    // Benchmark 성능 분석에는 사용하지 않는다.
+    if (combinedChecksum != 0)
+    {
+        // 의도적으로 아무 출력도 하지 않는다.
+        // 값 자체가 프로그램 흐름에 사용되고 있다.
+    }
+
+
     return result;
 }
 
 
 // ---------------------------------------------------------
-// printBenchmarkTable
+// 결과 표
 // ---------------------------------------------------------
 void printBenchmarkTable(
     BenchmarkResult* results,
@@ -372,38 +373,32 @@ void printBenchmarkTable(
 }
 
 
-// ---------------------------------------------------------
-// main
-// ---------------------------------------------------------
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.14 Workload Benchmark ===\n\n";
+        << "=== CoreFlow v0.15 CPU Benchmark ===\n\n";
 
 
-    // -----------------------------------------------------
-    // 세 종류의 Workload 생성
-    // -----------------------------------------------------
-    BenchmarkWorkload balanced(
-        WorkloadType::Balanced
+    BenchmarkWorkload sleepBalanced(
+        WorkloadType::SleepBalanced
     );
 
 
-    BenchmarkWorkload imbalanced(
-        WorkloadType::Imbalanced
+    BenchmarkWorkload cpuBalanced(
+        WorkloadType::CpuBalanced
     );
 
 
-    BenchmarkWorkload fineGrained(
-        WorkloadType::FineGrained
+    BenchmarkWorkload cpuImbalanced(
+        WorkloadType::CpuImbalanced
     );
 
 
     BenchmarkWorkload* workloads[] =
     {
-        &balanced,
-        &imbalanced,
-        &fineGrained
+        &sleepBalanced,
+        &cpuBalanced,
+        &cpuImbalanced
     };
 
 
@@ -412,9 +407,6 @@ int main()
         / sizeof(workloads[0]);
 
 
-    // -----------------------------------------------------
-    // 비교할 Worker 개수
-    // -----------------------------------------------------
     const std::size_t workerCounts[] =
     {
         1,
@@ -429,15 +421,10 @@ int main()
         / sizeof(workerCounts[0]);
 
 
-    // Workload 종류가 늘었으므로
-    // 우선 각 조건당 3번 반복한다.
     constexpr std::size_t runCount =
         3;
 
 
-    // -----------------------------------------------------
-    // Workload별 Benchmark
-    // -----------------------------------------------------
     for (
         std::size_t workloadIndex = 0;
         workloadIndex < workloadCount;
@@ -465,9 +452,11 @@ int main()
 
 
         std::cout
-            << "Total Simulated Work: "
-            << workload.totalDurationMs()
-            << " ms\n";
+            << "Total Work: "
+            << workload.totalWorkAmount()
+            << ' '
+            << workload.workUnit()
+            << '\n';
 
 
         std::cout
@@ -479,9 +468,6 @@ int main()
         ];
 
 
-        // -------------------------------------------------
-        // 1 / 2 / 4 / 8 Worker
-        // -------------------------------------------------
         for (
             std::size_t i = 0;
             i < workerCaseCount;
@@ -507,10 +493,8 @@ int main()
         }
 
 
-        // -------------------------------------------------
-        // 1 Worker를 Baseline으로 Speedup 계산
-        // -------------------------------------------------
-        double baselineMs =
+        // 1 Worker를 Baseline으로 사용
+        const double baselineMs =
             results[0].averageMs;
 
 
@@ -525,19 +509,6 @@ int main()
                 / results[i].averageMs;
 
 
-            // ---------------------------------------------
-            // Parallel Efficiency
-            //
-            // Efficiency =
-            //
-            //     Speedup
-            //     -------
-            //     Workers
-            //
-            // × 100
-            //
-            // 2 Worker에서 2.0x라면 100%
-            // ---------------------------------------------
             results[i].efficiency =
                 (
                     results[i].speedup
@@ -550,7 +521,6 @@ int main()
         }
 
 
-        // 최종 표 출력
         std::cout
             << "=== "
             << workload.name()

@@ -5,9 +5,6 @@
 #include <thread>
 
 
-// ---------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------
 CoreThreadPool::CoreThreadPool(
     std::size_t workerCount,
     bool verbose
@@ -19,7 +16,8 @@ CoreThreadPool::CoreThreadPool(
       m_verbose(verbose),
       m_remainingTasks(0),
       m_shutdownRequested(false),
-      m_startBarrier(workerCount)
+      m_startBarrier(workerCount),
+      m_computeSink(0)
 {
     if (m_workerCount > 0)
     {
@@ -40,9 +38,6 @@ CoreThreadPool::CoreThreadPool(
 }
 
 
-// ---------------------------------------------------------
-// Destructor
-// ---------------------------------------------------------
 CoreThreadPool::~CoreThreadPool()
 {
     if (m_started)
@@ -64,8 +59,7 @@ CoreThreadPool::~CoreThreadPool()
 // ---------------------------------------------------------
 // submit
 //
-// Round-Robin 방식으로 Task를
-// 각 Worker의 Local Deque에 배치한다.
+// Round-Robin Task Distribution
 // ---------------------------------------------------------
 bool CoreThreadPool::submit(
     const Task& task
@@ -102,8 +96,6 @@ bool CoreThreadPool::submit(
     }
 
 
-    // Task가 Queue에 공개되기 전에
-    // 미완료 Task 수를 먼저 증가시킨다.
     m_remainingTasks.fetch_add(1);
 
 
@@ -132,7 +124,6 @@ bool CoreThreadPool::submit(
     }
 
 
-    // Sleeping Worker 하나 깨우기
     m_workSignal.notifyOne();
 
 
@@ -142,11 +133,6 @@ bool CoreThreadPool::submit(
 
 // ---------------------------------------------------------
 // start
-//
-// Worker Thread 생성.
-//
-// 모든 Worker가 Start Barrier에
-// 도착할 때까지 Main Thread도 기다린다.
 // ---------------------------------------------------------
 void CoreThreadPool::start()
 {
@@ -181,8 +167,6 @@ void CoreThreadPool::start()
 
 // ---------------------------------------------------------
 // beginExecution
-//
-// Start Barrier 개방.
 // ---------------------------------------------------------
 void CoreThreadPool::beginExecution()
 {
@@ -192,10 +176,6 @@ void CoreThreadPool::beginExecution()
 
 // ---------------------------------------------------------
 // shutdown
-//
-// 추가 Task 제출을 막는다.
-//
-// 이미 제출된 Task는 모두 처리한다.
 // ---------------------------------------------------------
 void CoreThreadPool::shutdown()
 {
@@ -204,8 +184,6 @@ void CoreThreadPool::shutdown()
     );
 
 
-    // beginExecution() 전에 shutdown되어도
-    // Barrier에서 영원히 기다리지 않도록 한다.
     m_startBarrier.release();
 
 
@@ -221,8 +199,6 @@ void CoreThreadPool::shutdown()
     }
 
 
-    // 잠든 Worker가 종료 조건을 확인하도록
-    // 모두 깨운다.
     m_workSignal.notifyAll();
 }
 
@@ -264,15 +240,6 @@ void CoreThreadPool::wait()
 
 // ---------------------------------------------------------
 // trySteal
-//
-// 자신의 Local Queue가 비었다면
-// 다른 Worker의 FRONT에서 Task를 훔친다.
-//
-// Owner:
-//      popBack()
-//
-// Thief:
-//      popFront()
 // ---------------------------------------------------------
 bool CoreThreadPool::trySteal(
     std::size_t thiefId,
@@ -332,16 +299,6 @@ bool CoreThreadPool::trySteal(
 
 // ---------------------------------------------------------
 // workerLoop
-//
-// Worker Scheduling Policy:
-//
-// 1. Start Barrier
-// 2. Local popBack()
-// 3. 실패하면 Work Stealing
-// 4. Task 실행
-// 5. 일이 없으면 Sleep
-// 6. 새로운 일이 생기면 Wake
-// 7. 모든 Task 완료 후 종료
 // ---------------------------------------------------------
 void CoreThreadPool::workerLoop(
     std::size_t workerId
@@ -374,7 +331,6 @@ void CoreThreadPool::workerLoop(
 
     while (true)
     {
-        // Lost Wake-Up 방지용
         std::size_t observedGeneration =
             m_workSignal.snapshot();
 
@@ -382,18 +338,14 @@ void CoreThreadPool::workerLoop(
         Task task{};
 
 
-        // -------------------------------------------------
-        // 1. 자신의 Local Queue
-        // -------------------------------------------------
+        // 자기 Local Queue의 Back에서 가져온다.
         bool hasTask =
             worker
                 .localQueue
                 .tryPopBack(task);
 
 
-        // -------------------------------------------------
-        // 2. Local Queue가 비어 있다면 Steal
-        // -------------------------------------------------
+        // 자기 일이 없다면 Steal
         if (!hasTask)
         {
             std::size_t victimId =
@@ -427,9 +379,7 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // -------------------------------------------------
-        // 3. Task 획득 성공
-        // -------------------------------------------------
+        // Task 실행
         if (hasTask)
         {
             executeTask(
@@ -447,8 +397,6 @@ void CoreThreadPool::workerLoop(
                 m_remainingTasks.fetch_sub(1);
 
 
-            // 마지막 Task를 끝낸 Worker라면
-            // 다른 Worker를 깨워 종료 조건 확인
             if (
                 previousRemaining == 1
                 &&
@@ -463,9 +411,7 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // -------------------------------------------------
-        // 4. 종료 조건
-        // -------------------------------------------------
+        // 모든 Task 완료
         if (
             m_shutdownRequested.load()
             &&
@@ -476,9 +422,7 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // -------------------------------------------------
-        // 5. 할 일이 없으면 Sleep
-        // -------------------------------------------------
+        // Idle -> Sleep
         worker
             .statistics
             .sleepCount++;
@@ -515,8 +459,7 @@ void CoreThreadPool::workerLoop(
 // ---------------------------------------------------------
 // executeTask
 //
-// 현재 Benchmark Task는 durationMs만큼
-// Sleep하는 Synthetic Task다.
+// TaskType에 따라 실제 실행 방식을 결정한다.
 // ---------------------------------------------------------
 void CoreThreadPool::executeTask(
     std::size_t workerId,
@@ -536,11 +479,50 @@ void CoreThreadPool::executeTask(
     }
 
 
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(
-            task.durationMs
-        )
-    );
+    // -----------------------------------------------------
+    // Sleep Task
+    //
+    // CPU 계산을 하지 않고 일정 시간 Waiting.
+    // -----------------------------------------------------
+    if (
+        task.type
+        == TaskType::Sleep
+    )
+    {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(
+                task.workAmount
+            )
+        );
+    }
+
+    // -----------------------------------------------------
+    // Compute Task
+    //
+    // 실제 CPU 계산 수행.
+    // -----------------------------------------------------
+    else if (
+        task.type
+        == TaskType::Compute
+    )
+    {
+        std::uint64_t result =
+            executeComputeKernel(
+                task
+            );
+
+
+        // 결과를 실제 observable state에 반영한다.
+        //
+        // relaxed:
+        // 이 값은 Thread Synchronization 용도가 아니라
+        // 계산 제거 방지 목적이므로 강한 memory ordering이
+        // 필요하지 않다.
+        m_computeSink.fetch_xor(
+            result,
+            std::memory_order_relaxed
+        );
+    }
 
 
     if (m_verbose)
@@ -558,10 +540,60 @@ void CoreThreadPool::executeTask(
 
 
 // ---------------------------------------------------------
-// pendingTaskCount
+// executeComputeKernel
 //
-// Queue 안에서 기다리는 Task만 센다.
-// 실행 중인 Task는 포함하지 않는다.
+// CPU-Bound Synthetic Workload.
+//
+// 이전 계산 결과를 다음 계산이 계속 사용하기 때문에
+// 단순한 독립 반복보다 실제 CPU 계산 부하를 만든다.
+//
+// 최종 결과가 m_computeSink에서 사용되므로
+// Release Optimization에서도 전체 계산을
+// 제거할 수 없다.
+// ---------------------------------------------------------
+std::uint64_t
+CoreThreadPool::executeComputeKernel(
+    const Task& task
+)
+{
+    std::uint64_t value =
+        0x9E3779B97F4A7C15ULL
+        +
+        static_cast<std::uint64_t>(
+            task.id
+        );
+
+
+    for (
+        std::uint64_t i = 0;
+        i < task.workAmount;
+        i++
+    )
+    {
+        // xorshift 기반 정수 연산
+        value ^=
+            value >> 12;
+
+
+        value ^=
+            value << 25;
+
+
+        value ^=
+            value >> 27;
+
+
+        value *=
+            2685821657736338717ULL;
+    }
+
+
+    return value;
+}
+
+
+// ---------------------------------------------------------
+// pendingTaskCount
 // ---------------------------------------------------------
 std::size_t
 CoreThreadPool::pendingTaskCount()
@@ -589,10 +621,6 @@ CoreThreadPool::pendingTaskCount()
 
 // ---------------------------------------------------------
 // getStatistics
-//
-// 모든 Worker 통계를 합산하여 반환.
-//
-// Benchmark에서는 pool.wait() 이후 호출한다.
 // ---------------------------------------------------------
 CoreSchedulerStatistics
 CoreThreadPool::getStatistics() const
@@ -727,4 +755,16 @@ void CoreThreadPool::printStatistics() const
         << "Wake Count     : "
         << total.wakeCount
         << '\n';
+}
+
+
+// ---------------------------------------------------------
+// Compute 결과 확인용
+// ---------------------------------------------------------
+std::uint64_t
+CoreThreadPool::computeChecksum() const
+{
+    return m_computeSink.load(
+        std::memory_order_relaxed
+    );
 }
