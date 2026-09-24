@@ -242,6 +242,10 @@ bool CoreThreadPool::trySteal(
     }
 
 
+    WorkerState& thief =
+        m_workers[thiefId];
+
+
     for (
         std::size_t offset = 1;
         offset < m_workerCount;
@@ -253,6 +257,14 @@ bool CoreThreadPool::trySteal(
             % m_workerCount;
 
 
+        // -------------------------------------------------
+        // Victim Queue 하나를 실제로 검사한다.
+        //
+        // 성공 여부와 관계없이 시도 자체를 기록한다.
+        // -------------------------------------------------
+        thief.statistics.stealAttempts++;
+
+
         if (
             m_workers[candidate]
                 .localQueue
@@ -260,6 +272,11 @@ bool CoreThreadPool::trySteal(
         )
         {
             victimId = candidate;
+
+
+            // 실제 Steal 성공
+            thief.statistics.stolenTasks++;
+
 
             return true;
         }
@@ -270,18 +287,6 @@ bool CoreThreadPool::trySteal(
 }
 
 
-// ---------------------------------------------------------
-// Worker Loop
-//
-// v0.10 핵심:
-//
-// 1. Work Signal generation 기록
-// 2. Local Queue 확인
-// 3. 없으면 Steal
-// 4. Task 있으면 실행
-// 5. 아무것도 없으면 Sleep
-// 6. submit/shutdown으로 Wake
-// ---------------------------------------------------------
 void CoreThreadPool::workerLoop(
     std::size_t workerId
 )
@@ -299,9 +304,10 @@ void CoreThreadPool::workerLoop(
     while (true)
     {
         // -------------------------------------------------
-        // 작업 탐색 전에 현재 generation을 기억한다.
+        // 현재 Work Signal 상태 기억
         //
-        // 이것이 lost wake-up 방지의 핵심이다.
+        // Task 탐색과 Sleep 사이에서 발생할 수 있는
+        // Lost Wake-Up을 방지하기 위해 사용한다.
         // -------------------------------------------------
         std::size_t observedGeneration =
             m_workSignal.snapshot();
@@ -311,7 +317,9 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 1. 자기 Local Queue
+        // 1. 자신의 Local Queue 확인
+        //
+        // Owner는 Deque BACK을 사용한다.
         // -------------------------------------------------
         bool hasTask =
             worker
@@ -320,7 +328,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 2. Local Queue가 비었으면 Steal
+        // 2. 자기 Task가 없으면 Work Stealing
         // -------------------------------------------------
         if (!hasTask)
         {
@@ -351,7 +359,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // Task 발견
+        // 3. Task 획득 성공
         // -------------------------------------------------
         if (hasTask)
         {
@@ -361,17 +369,17 @@ void CoreThreadPool::workerLoop(
             );
 
 
-            // fetch_sub()는 감소하기 전 값을 반환한다.
+            // 실제 실행을 완료한 Task 하나 기록
+            worker.statistics.executedTasks++;
+
+
             std::size_t previousRemaining =
                 m_remainingTasks.fetch_sub(1);
 
 
-            // -------------------------------------------------
-            // 내가 마지막 Task를 끝낸 Worker라면
-            //
-            // shutdown 상태에서 잠들어 있는 다른 Worker들도
-            // 종료 조건을 확인할 수 있게 모두 깨운다.
-            // -------------------------------------------------
+            // 내가 마지막 Task를 완료했다면
+            // shutdown 상태에서 잠든 Worker들도
+            // 종료 조건을 확인할 수 있도록 깨운다.
             if (
                 previousRemaining == 1
                 &&
@@ -387,7 +395,9 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // shutdown 상태이며 모든 Task가 끝났다면 종료.
+        // 4. Shutdown + 전체 Task 완료
+        //
+        // 더 이상 할 일이 없다.
         // -------------------------------------------------
         if (
             m_shutdownRequested.load()
@@ -400,17 +410,11 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 아무 일도 없음.
-        //
-        // v0.9:
-        //     std::this_thread::yield();
-        //
-        // v0.10:
-        //     실제 Sleep.
-        //
-        // generation이 바뀌거나
-        // 전체 종료 조건이 만족될 때 깨어난다.
+        // 5. Task를 찾지 못했으므로 Sleep
         // -------------------------------------------------
+        worker.statistics.sleepCount++;
+
+
         m_workSignal.waitForChange(
             observedGeneration,
             [this]()
@@ -421,6 +425,10 @@ void CoreThreadPool::workerLoop(
                     m_remainingTasks.load() == 0;
             }
         );
+
+
+        // waitForChange가 실제로 return했다.
+        worker.statistics.wakeCount++;
     }
 
 
@@ -492,4 +500,114 @@ CoreThreadPool::pendingTaskCount()
 
 
     return total;
+}
+
+void CoreThreadPool::printStatistics() const
+{
+    std::size_t totalExecuted = 0;
+    std::size_t totalStolen = 0;
+    std::size_t totalStealAttempts = 0;
+    std::size_t totalSleeps = 0;
+    std::size_t totalWakes = 0;
+
+
+    std::cout
+        << "\n=== Scheduler Statistics ===\n";
+
+
+    for (
+        std::size_t i = 0;
+        i < m_workerCount;
+        i++
+    )
+    {
+        const WorkerStatistics& stats =
+            m_workers[i].statistics;
+
+
+        std::cout
+            << "\nWorker "
+            << i
+            << '\n';
+
+
+        std::cout
+            << "  Executed Tasks : "
+            << stats.executedTasks
+            << '\n';
+
+
+        std::cout
+            << "  Stolen Tasks   : "
+            << stats.stolenTasks
+            << '\n';
+
+
+        std::cout
+            << "  Steal Attempts : "
+            << stats.stealAttempts
+            << '\n';
+
+
+        std::cout
+            << "  Sleep Count    : "
+            << stats.sleepCount
+            << '\n';
+
+
+        std::cout
+            << "  Wake Count     : "
+            << stats.wakeCount
+            << '\n';
+
+
+        totalExecuted +=
+            stats.executedTasks;
+
+        totalStolen +=
+            stats.stolenTasks;
+
+        totalStealAttempts +=
+            stats.stealAttempts;
+
+        totalSleeps +=
+            stats.sleepCount;
+
+        totalWakes +=
+            stats.wakeCount;
+    }
+
+
+    std::cout
+        << "\n--- Total ---\n";
+
+
+    std::cout
+        << "Executed Tasks : "
+        << totalExecuted
+        << '\n';
+
+
+    std::cout
+        << "Stolen Tasks   : "
+        << totalStolen
+        << '\n';
+
+
+    std::cout
+        << "Steal Attempts : "
+        << totalStealAttempts
+        << '\n';
+
+
+    std::cout
+        << "Sleep Count    : "
+        << totalSleeps
+        << '\n';
+
+
+    std::cout
+        << "Wake Count     : "
+        << totalWakes
+        << '\n';
 }

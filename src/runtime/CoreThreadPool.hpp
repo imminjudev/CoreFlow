@@ -18,7 +18,6 @@ private:
 
     std::size_t m_workerCount;
 
-    // Round-Robin 배치용
     std::size_t m_nextWorker;
 
     CoreSpinLock m_submitLock;
@@ -26,20 +25,15 @@ private:
     bool m_started;
 
 
-    // -----------------------------------------------------
-    // Queue에 있거나 현재 실행 중인
-    // 전체 미완료 Task 개수
-    // -----------------------------------------------------
+    // Queue 대기 + 실행 중인 모든 미완료 Task
     std::atomic<std::size_t> m_remainingTasks;
 
 
-    // shutdown 요청 여부
+    // shutdown 이후 새로운 submit을 차단한다.
     std::atomic<bool> m_shutdownRequested;
 
 
-    // -----------------------------------------------------
-    // Worker 전체가 공유하는 Wake/Sleep Signal
-    // -----------------------------------------------------
+    // Sleeping Worker들을 깨우기 위한 Global Signal
     CoreWorkSignal m_workSignal;
 
 
@@ -94,4 +88,9 @@ public:
 
 
     std::size_t pendingTaskCount();
+
+
+    // 모든 Worker가 종료된 뒤
+    // Scheduler 실행 통계를 출력한다.
+    void printStatistics() const;
 };

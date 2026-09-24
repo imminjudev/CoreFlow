@@ -8,7 +8,7 @@
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.10 ===\n\n";
+        << "=== CoreFlow v0.11 ===\n\n";
 
 
     CoreThreadPool pool(2);
@@ -21,12 +21,8 @@ int main()
         << "[MAIN] Pool started with no tasks\n";
 
 
-    // -----------------------------------------------------
-    // Worker에게 할 일이 없는 상태.
-    //
-    // v0.10 Worker는 여기서 busy-loop를 돌지 않고
-    // Global Work Signal을 기다리며 Sleep한다.
-    // -----------------------------------------------------
+    // Worker들이 일이 없는 상태에서
+    // Sleep하는 상황을 만든다.
     std::this_thread::sleep_for(
         std::chrono::milliseconds(1000)
     );
@@ -92,6 +88,15 @@ int main()
 
     std::cout
         << "\nAll tasks completed.\n";
+
+
+    // -----------------------------------------------------
+    // 모든 Worker가 join된 이후 통계 출력.
+    //
+    // 따라서 WorkerStatistics를 Main Thread가 읽는 동안
+    // 다른 Worker가 수정하지 않는다.
+    // -----------------------------------------------------
+    pool.printStatistics();
 
 
     return 0;
