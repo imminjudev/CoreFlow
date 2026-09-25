@@ -24,8 +24,7 @@ CoreThreadPool::CoreThreadPool(
       m_remainingTasks(0),
       m_queuedTasks(0),
       m_shutdownRequested(false),
-      m_startBarrier(workerCount),
-      m_computeSink(0)
+      m_startBarrier(workerCount)
 {
     if (m_workerCount > 0)
     {
@@ -43,6 +42,7 @@ CoreThreadPool::CoreThreadPool(
                 i;
 
 
+            // Worker별 deterministic PRNG seed
             std::uint64_t seed =
                 0x9E3779B97F4A7C15ULL
                 ^
@@ -63,6 +63,11 @@ CoreThreadPool::CoreThreadPool(
 
             m_workers[i].randomState =
                 seed;
+
+
+            // Worker 전용 Compute Checksum 초기화
+            m_workers[i].computeChecksum =
+                0;
         }
     }
 }
@@ -127,12 +132,7 @@ bool CoreThreadPool::submit(
     }
 
 
-    // -----------------------------------------------------
-    // Task를 Queue에 공개하기 전에 증가시킨다.
-    //
-    // Worker가 push 직후 Task를 매우 빠르게 가져가는
-    // Race를 막기 위한 순서다.
-    // -----------------------------------------------------
+    // Task가 Queue에 공개되기 전에 증가
     m_remainingTasks.fetch_add(1);
 
     m_queuedTasks.fetch_add(1);
@@ -144,7 +144,7 @@ bool CoreThreadPool::submit(
             .pushBack(task);
 
 
-    // Queue가 이미 Close된 경우 rollback
+    // Queue가 닫혀 있다면 rollback
     if (!success)
     {
         m_queuedTasks.fetch_sub(1);
@@ -227,6 +227,7 @@ void CoreThreadPool::shutdown()
     );
 
 
+    // beginExecution 이전 shutdown 방어
     m_startBarrier.release();
 
 
@@ -282,7 +283,9 @@ void CoreThreadPool::wait()
 
 
 // ---------------------------------------------------------
-// Worker 전용 xorshift64*
+// Worker별 PRNG
+//
+// xorshift64*
 // ---------------------------------------------------------
 std::uint64_t
 CoreThreadPool::nextRandom(
@@ -541,6 +544,7 @@ void CoreThreadPool::workerLoop(
     }
 
 
+    // Benchmark Start Barrier
     m_startBarrier.arriveAndWait();
 
 
@@ -559,7 +563,6 @@ void CoreThreadPool::workerLoop(
 
     while (true)
     {
-        // Lost Wake-Up 방지용
         std::size_t observedGeneration =
             m_workSignal.snapshot();
 
@@ -568,7 +571,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 1. 자신의 Local Queue에서 Task 획득
+        // 1. 자신의 Local Queue
         // -------------------------------------------------
         bool hasTask =
             worker
@@ -578,16 +581,12 @@ void CoreThreadPool::workerLoop(
 
         if (hasTask)
         {
-            // Queue에서 Task 하나가 빠졌으므로 감소
             m_queuedTasks.fetch_sub(1);
         }
 
 
         // -------------------------------------------------
-        // 2. Local Queue가 비었다면 종료 여부를 먼저 확인
-        //
-        // 모든 Task가 이미 완료된 상태라면
-        // Steal Scan조차 할 이유가 없다.
+        // 2. 모든 Task가 이미 끝났으면 바로 종료
         // -------------------------------------------------
         if (
             !hasTask
@@ -611,19 +610,7 @@ void CoreThreadPool::workerLoop(
                 == SchedulingMode::WorkStealing
         )
         {
-            // -------------------------------------------------
-            // 핵심:
-            //
-            // 아직 Queue에 Task가 하나라도 있을 때만
-            // Victim Search를 수행한다.
-            //
-            // queuedTasks == 0이라면
-            //
-            // remainingTasks > 0
-            //
-            // 이어도 모든 Task가 이미 다른 Worker에서
-            // 실행 중이라는 뜻이다.
-            // -------------------------------------------------
+            // 실제 Queue에 Task가 있을 때만 Scan
             if (
                 m_queuedTasks.load() > 0
             )
@@ -644,7 +631,7 @@ void CoreThreadPool::workerLoop(
                         true;
 
 
-                    // Steal 또한 Queue에서 Task를 제거한 것
+                    // Victim Queue에서 Task 하나 제거됨
                     m_queuedTasks.fetch_sub(1);
 
 
@@ -663,12 +650,6 @@ void CoreThreadPool::workerLoop(
             }
             else
             {
-                // -------------------------------------------------
-                // v0.17이었다면 여기서 Victim Queue 전체를
-                // 검사했을 상황.
-                //
-                // v0.18에서는 바로 Scan을 생략한다.
-                // -------------------------------------------------
                 worker
                     .statistics
                     .stealSkippedNoQueuedWork++;
@@ -692,12 +673,11 @@ void CoreThreadPool::workerLoop(
                 .executedTasks++;
 
 
-            // 실행 완료
             std::size_t previousRemaining =
                 m_remainingTasks.fetch_sub(1);
 
 
-            // 마지막 Task 종료
+            // 마지막 Task 완료
             if (
                 previousRemaining == 1
                 &&
@@ -713,8 +693,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 5. Steal 도중 다른 Worker가 마지막 Task를
-        //    끝냈을 가능성이 있으므로 다시 확인
+        // 5. Steal 탐색 중 마지막 Task가 끝났을 수도 있음
         // -------------------------------------------------
         if (
             m_shutdownRequested.load()
@@ -727,7 +706,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 6. Idle -> Wait
+        // 6. Idle Wait
         // -------------------------------------------------
         worker
             .statistics
@@ -783,6 +762,9 @@ void CoreThreadPool::executeTask(
     }
 
 
+    // -----------------------------------------------------
+    // Sleep Task
+    // -----------------------------------------------------
     if (
         task.type
         == TaskType::Sleep
@@ -794,6 +776,10 @@ void CoreThreadPool::executeTask(
             )
         );
     }
+
+    // -----------------------------------------------------
+    // Compute Task
+    // -----------------------------------------------------
     else if (
         task.type
         == TaskType::Compute
@@ -805,10 +791,23 @@ void CoreThreadPool::executeTask(
             );
 
 
-        m_computeSink.fetch_xor(
-            result,
-            std::memory_order_relaxed
-        );
+        // -------------------------------------------------
+        // v0.20 핵심 변경
+        //
+        // 기존:
+        //
+        // global atomic.fetch_xor(...)
+        //
+        // 현재:
+        //
+        // 실행 Worker 자신의 일반 uint64_t만 수정.
+        //
+        // 이 Worker Thread만 해당 필드를 수정하므로
+        // atomic synchronization이 필요 없다.
+        // -------------------------------------------------
+        m_workers[workerId]
+            .computeChecksum
+            ^= result;
     }
 
 
@@ -871,8 +870,6 @@ CoreThreadPool::executeComputeKernel(
 
 // ---------------------------------------------------------
 // pendingTaskCount
-//
-// 각 Local Queue 크기를 합산.
 // ---------------------------------------------------------
 std::size_t
 CoreThreadPool::pendingTaskCount()
@@ -900,8 +897,6 @@ CoreThreadPool::pendingTaskCount()
 
 // ---------------------------------------------------------
 // queuedTaskCount
-//
-// m_queuedTasks의 현재 값.
 // ---------------------------------------------------------
 std::size_t
 CoreThreadPool::queuedTaskCount() const
@@ -1098,12 +1093,43 @@ void CoreThreadPool::printStatistics() const
 
 
 // ---------------------------------------------------------
-// Compute Checksum
+// computeChecksum
+//
+// 각 Worker의 local checksum을 최종적으로 XOR.
+//
+// XOR은 순서에 관계없이 결과가 같다.
+//
+// A ^ B ^ C
+//
+// 와
+//
+// C ^ A ^ B
+//
+// 는 같은 결과가 나온다.
+//
+// 따라서 Task가 어느 Worker에서 실행되었는지와 관계없이
+// 동일한 Task 집합이면 최종 checksum도 동일하다.
+//
+// 반드시 모든 Worker가 join된 뒤 호출하는 것을 전제로 한다.
 // ---------------------------------------------------------
 std::uint64_t
 CoreThreadPool::computeChecksum() const
 {
-    return m_computeSink.load(
-        std::memory_order_relaxed
-    );
+    std::uint64_t finalChecksum =
+        0;
+
+
+    for (
+        std::size_t i = 0;
+        i < m_workerCount;
+        i++
+    )
+    {
+        finalChecksum ^=
+            m_workers[i]
+                .computeChecksum;
+    }
+
+
+    return finalChecksum;
 }

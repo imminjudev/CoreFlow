@@ -70,25 +70,11 @@ private:
     StealPolicy m_stealPolicy;
 
 
-    // -----------------------------------------------------
-    // 아직 완료되지 않은 전체 Task
-    //
-    // Queue 대기 Task
-    // +
-    // 현재 실행 중인 Task
-    // -----------------------------------------------------
+    // Queue 대기 + 실행 중인 전체 Task
     std::atomic<std::size_t> m_remainingTasks;
 
 
-    // -----------------------------------------------------
-    // 아직 Queue 안에 존재하는 Task
-    //
-    // Worker가 Local Pop 또는 Steal로 가져가면 감소.
-    //
-    // 이 값이 0이라면 현재 다른 Worker들이
-    // Task를 실행 중일 수는 있어도
-    // "훔칠 수 있는 Task"는 없다.
-    // -----------------------------------------------------
+    // Queue 안에 실제 존재하는 Task
     std::atomic<std::size_t> m_queuedTasks;
 
 
@@ -98,9 +84,6 @@ private:
     CoreWorkSignal m_workSignal;
 
     CoreStartBarrier m_startBarrier;
-
-
-    std::atomic<std::uint64_t> m_computeSink;
 
 
 private:
@@ -187,7 +170,6 @@ public:
     std::size_t pendingTaskCount();
 
 
-    // 실제 전역 Queue Task 수
     std::size_t queuedTaskCount() const;
 
 
@@ -198,6 +180,11 @@ public:
     void printStatistics() const;
 
 
+    // -----------------------------------------------------
+    // 모든 Worker의 Compute Checksum을 합산한다.
+    //
+    // pool.wait() 이후 호출하는 것을 전제로 한다.
+    // -----------------------------------------------------
     std::uint64_t
         computeChecksum() const;
 };
