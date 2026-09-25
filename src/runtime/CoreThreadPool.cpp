@@ -22,6 +22,7 @@ CoreThreadPool::CoreThreadPool(
       m_mode(mode),
       m_stealPolicy(stealPolicy),
       m_remainingTasks(0),
+      m_queuedTasks(0),
       m_shutdownRequested(false),
       m_startBarrier(workerCount),
       m_computeSink(0)
@@ -42,12 +43,6 @@ CoreThreadPool::CoreThreadPool(
                 i;
 
 
-            // -------------------------------------------------
-            // Worker별 deterministic seed
-            //
-            // 같은 Worker ID라도 0이 아닌 서로 다른
-            // 초기 상태를 가지도록 만든다.
-            // -------------------------------------------------
             std::uint64_t seed =
                 0x9E3779B97F4A7C15ULL
                 ^
@@ -132,9 +127,15 @@ bool CoreThreadPool::submit(
     }
 
 
-    // Queue에 Task를 공개하기 전에
-    // 미완료 Task 수를 먼저 증가.
+    // -----------------------------------------------------
+    // Task를 Queue에 공개하기 전에 증가시킨다.
+    //
+    // Worker가 push 직후 Task를 매우 빠르게 가져가는
+    // Race를 막기 위한 순서다.
+    // -----------------------------------------------------
     m_remainingTasks.fetch_add(1);
+
+    m_queuedTasks.fetch_add(1);
 
 
     bool success =
@@ -143,9 +144,13 @@ bool CoreThreadPool::submit(
             .pushBack(task);
 
 
+    // Queue가 이미 Close된 경우 rollback
     if (!success)
     {
+        m_queuedTasks.fetch_sub(1);
+
         m_remainingTasks.fetch_sub(1);
+
 
         return false;
     }
@@ -277,12 +282,7 @@ void CoreThreadPool::wait()
 
 
 // ---------------------------------------------------------
-// nextRandom
-//
-// xorshift64*
-//
-// std::random을 사용하지 않고
-// Worker별 PRNG를 직접 구현한다.
+// Worker 전용 xorshift64*
 // ---------------------------------------------------------
 std::uint64_t
 CoreThreadPool::nextRandom(
@@ -318,10 +318,7 @@ CoreThreadPool::nextRandom(
 
 
 // ---------------------------------------------------------
-// trySteal
-//
-// 현재 StealPolicy에 맞는
-// Victim Selection 알고리즘을 호출한다.
+// Steal Policy 선택
 // ---------------------------------------------------------
 bool CoreThreadPool::trySteal(
     std::size_t thiefId,
@@ -360,15 +357,6 @@ bool CoreThreadPool::trySteal(
 
 // ---------------------------------------------------------
 // Sequential Victim Search
-//
-// thiefId 다음 Worker부터 고정된 순서로 탐색.
-//
-// 예:
-//
-// thief = 3
-// workers = 8
-//
-// 4 -> 5 -> 6 -> 7 -> 0 -> 1 -> 2
 // ---------------------------------------------------------
 bool CoreThreadPool::tryStealSequential(
     std::size_t thiefId,
@@ -418,7 +406,6 @@ bool CoreThreadPool::tryStealSequential(
                 .stolenTasks++;
 
 
-            // 성공한 탐색이 몇 번의 Probe를 필요로 했는지 기록
             thief
                 .statistics
                 .successfulStealProbes
@@ -430,7 +417,6 @@ bool CoreThreadPool::tryStealSequential(
     }
 
 
-    // 모든 Victim을 확인했지만 실패
     thief
         .statistics
         .failedStealRounds++;
@@ -442,15 +428,6 @@ bool CoreThreadPool::tryStealSequential(
 
 // ---------------------------------------------------------
 // Random-Start Victim Search
-//
-// Victim 전체를 무작위 중복 방식으로 찍는 것이 아니라,
-// "첫 번째 Victim"만 Random하게 정한다.
-//
-// 이후에는 원형 순서로 모든 Victim을 정확히 한 번씩
-// 검사할 수 있다.
-//
-// 따라서 Sequential과 동일하게
-// 최악의 경우 모든 Victim을 검사한다.
 // ---------------------------------------------------------
 bool CoreThreadPool::tryStealRandomStart(
     std::size_t thiefId,
@@ -466,13 +443,6 @@ bool CoreThreadPool::tryStealRandomStart(
         m_workerCount - 1;
 
 
-    // -----------------------------------------------------
-    // offset 후보:
-    //
-    // 1 ~ workerCount - 1
-    //
-    // Random 값으로 이 목록의 시작 위치를 고른다.
-    // -----------------------------------------------------
     std::size_t startIndex =
         static_cast<std::size_t>(
             nextRandom(thiefId)
@@ -490,7 +460,6 @@ bool CoreThreadPool::tryStealRandomStart(
         probe++
     )
     {
-        // 0 ~ victimCount-1
         std::size_t offsetIndex =
             (
                 startIndex
@@ -500,7 +469,6 @@ bool CoreThreadPool::tryStealRandomStart(
             % victimCount;
 
 
-        // 실제 Worker offset은 1부터 시작
         std::size_t offset =
             offsetIndex + 1;
 
@@ -591,6 +559,7 @@ void CoreThreadPool::workerLoop(
 
     while (true)
     {
+        // Lost Wake-Up 방지용
         std::size_t observedGeneration =
             m_workSignal.snapshot();
 
@@ -599,7 +568,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 1. 자신의 Queue
+        // 1. 자신의 Local Queue에서 Task 획득
         // -------------------------------------------------
         bool hasTask =
             worker
@@ -607,8 +576,33 @@ void CoreThreadPool::workerLoop(
                 .tryPopBack(task);
 
 
+        if (hasTask)
+        {
+            // Queue에서 Task 하나가 빠졌으므로 감소
+            m_queuedTasks.fetch_sub(1);
+        }
+
+
         // -------------------------------------------------
-        // 2. Work Stealing
+        // 2. Local Queue가 비었다면 종료 여부를 먼저 확인
+        //
+        // 모든 Task가 이미 완료된 상태라면
+        // Steal Scan조차 할 이유가 없다.
+        // -------------------------------------------------
+        if (
+            !hasTask
+            &&
+            m_shutdownRequested.load()
+            &&
+            m_remainingTasks.load() == 0
+        )
+        {
+            break;
+        }
+
+
+        // -------------------------------------------------
+        // 3. Work Stealing
         // -------------------------------------------------
         if (
             !hasTask
@@ -617,39 +611,73 @@ void CoreThreadPool::workerLoop(
                 == SchedulingMode::WorkStealing
         )
         {
-            std::size_t victimId =
-                0;
-
-
+            // -------------------------------------------------
+            // 핵심:
+            //
+            // 아직 Queue에 Task가 하나라도 있을 때만
+            // Victim Search를 수행한다.
+            //
+            // queuedTasks == 0이라면
+            //
+            // remainingTasks > 0
+            //
+            // 이어도 모든 Task가 이미 다른 Worker에서
+            // 실행 중이라는 뜻이다.
+            // -------------------------------------------------
             if (
-                trySteal(
-                    workerId,
-                    task,
-                    victimId
-                )
+                m_queuedTasks.load() > 0
             )
             {
-                hasTask =
-                    true;
+                std::size_t victimId =
+                    0;
 
 
-                if (m_verbose)
+                if (
+                    trySteal(
+                        workerId,
+                        task,
+                        victimId
+                    )
+                )
                 {
-                    std::cout
-                        << "[STEAL] Worker "
-                        << workerId
-                        << " stole Task "
-                        << task.id
-                        << " from Worker "
-                        << victimId
-                        << '\n';
+                    hasTask =
+                        true;
+
+
+                    // Steal 또한 Queue에서 Task를 제거한 것
+                    m_queuedTasks.fetch_sub(1);
+
+
+                    if (m_verbose)
+                    {
+                        std::cout
+                            << "[STEAL] Worker "
+                            << workerId
+                            << " stole Task "
+                            << task.id
+                            << " from Worker "
+                            << victimId
+                            << '\n';
+                    }
                 }
+            }
+            else
+            {
+                // -------------------------------------------------
+                // v0.17이었다면 여기서 Victim Queue 전체를
+                // 검사했을 상황.
+                //
+                // v0.18에서는 바로 Scan을 생략한다.
+                // -------------------------------------------------
+                worker
+                    .statistics
+                    .stealSkippedNoQueuedWork++;
             }
         }
 
 
         // -------------------------------------------------
-        // 3. Task 실행
+        // 4. Task 실행
         // -------------------------------------------------
         if (hasTask)
         {
@@ -664,10 +692,12 @@ void CoreThreadPool::workerLoop(
                 .executedTasks++;
 
 
+            // 실행 완료
             std::size_t previousRemaining =
                 m_remainingTasks.fetch_sub(1);
 
 
+            // 마지막 Task 종료
             if (
                 previousRemaining == 1
                 &&
@@ -683,7 +713,8 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 4. 종료 조건
+        // 5. Steal 도중 다른 Worker가 마지막 Task를
+        //    끝냈을 가능성이 있으므로 다시 확인
         // -------------------------------------------------
         if (
             m_shutdownRequested.load()
@@ -696,7 +727,7 @@ void CoreThreadPool::workerLoop(
 
 
         // -------------------------------------------------
-        // 5. Idle Sleep
+        // 6. Idle -> Wait
         // -------------------------------------------------
         worker
             .statistics
@@ -840,6 +871,8 @@ CoreThreadPool::executeComputeKernel(
 
 // ---------------------------------------------------------
 // pendingTaskCount
+//
+// 각 Local Queue 크기를 합산.
 // ---------------------------------------------------------
 std::size_t
 CoreThreadPool::pendingTaskCount()
@@ -862,6 +895,18 @@ CoreThreadPool::pendingTaskCount()
 
 
     return total;
+}
+
+
+// ---------------------------------------------------------
+// queuedTaskCount
+//
+// m_queuedTasks의 현재 값.
+// ---------------------------------------------------------
+std::size_t
+CoreThreadPool::queuedTaskCount() const
+{
+    return m_queuedTasks.load();
 }
 
 
@@ -902,6 +947,10 @@ CoreThreadPool::getStatistics() const
 
         total.failedStealRounds +=
             stats.failedStealRounds;
+
+
+        total.stealSkippedNoQueuedWork +=
+            stats.stealSkippedNoQueuedWork;
 
 
         total.sleepCount +=
@@ -973,6 +1022,12 @@ void CoreThreadPool::printStatistics() const
 
 
         std::cout
+            << "  Skipped Empty Scans     : "
+            << stats.stealSkippedNoQueuedWork
+            << '\n';
+
+
+        std::cout
             << "  Sleep Count             : "
             << stats.sleepCount
             << '\n';
@@ -1020,6 +1075,12 @@ void CoreThreadPool::printStatistics() const
     std::cout
         << "Failed Steal Rounds     : "
         << total.failedStealRounds
+        << '\n';
+
+
+    std::cout
+        << "Skipped Empty Scans     : "
+        << total.stealSkippedNoQueuedWork
         << '\n';
 
 

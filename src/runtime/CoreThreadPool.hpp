@@ -13,9 +13,6 @@
 #include "runtime/WorkerState.hpp"
 
 
-// ---------------------------------------------------------
-// SchedulingMode
-// ---------------------------------------------------------
 enum class SchedulingMode
 {
     LocalOnly,
@@ -24,21 +21,6 @@ enum class SchedulingMode
 };
 
 
-// ---------------------------------------------------------
-// StealPolicy
-//
-// Sequential:
-//
-//     현재 Worker 다음 번호부터 순서대로 검사.
-//
-// RandomStart:
-//
-//     첫 Victim을 PRNG로 선택한 뒤,
-//     그 위치에서부터 원형으로 모든 Victim 검사.
-//
-// 둘 다 최악의 경우 모든 Victim을 검사한다.
-// 탐색 순서만 다르다.
-// ---------------------------------------------------------
 enum class StealPolicy
 {
     Sequential,
@@ -47,9 +29,6 @@ enum class StealPolicy
 };
 
 
-// ---------------------------------------------------------
-// Thread Pool 전체 통계
-// ---------------------------------------------------------
 struct CoreSchedulerStatistics
 {
     std::size_t executedTasks = 0;
@@ -61,6 +40,8 @@ struct CoreSchedulerStatistics
     std::size_t successfulStealProbes = 0;
 
     std::size_t failedStealRounds = 0;
+
+    std::size_t stealSkippedNoQueuedWork = 0;
 
     std::size_t sleepCount = 0;
 
@@ -89,7 +70,27 @@ private:
     StealPolicy m_stealPolicy;
 
 
+    // -----------------------------------------------------
+    // 아직 완료되지 않은 전체 Task
+    //
+    // Queue 대기 Task
+    // +
+    // 현재 실행 중인 Task
+    // -----------------------------------------------------
     std::atomic<std::size_t> m_remainingTasks;
+
+
+    // -----------------------------------------------------
+    // 아직 Queue 안에 존재하는 Task
+    //
+    // Worker가 Local Pop 또는 Steal로 가져가면 감소.
+    //
+    // 이 값이 0이라면 현재 다른 Worker들이
+    // Task를 실행 중일 수는 있어도
+    // "훔칠 수 있는 Task"는 없다.
+    // -----------------------------------------------------
+    std::atomic<std::size_t> m_queuedTasks;
+
 
     std::atomic<bool> m_shutdownRequested;
 
@@ -99,7 +100,6 @@ private:
     CoreStartBarrier m_startBarrier;
 
 
-    // CPU Compute 결과 저장
     std::atomic<std::uint64_t> m_computeSink;
 
 
@@ -109,7 +109,6 @@ private:
     );
 
 
-    // 선택된 Steal Policy 실행
     bool trySteal(
         std::size_t thiefId,
         Task& task,
@@ -117,7 +116,6 @@ private:
     );
 
 
-    // Sequential Victim Search
     bool tryStealSequential(
         std::size_t thiefId,
         Task& task,
@@ -125,7 +123,6 @@ private:
     );
 
 
-    // Random-Start Victim Search
     bool tryStealRandomStart(
         std::size_t thiefId,
         Task& task,
@@ -133,7 +130,6 @@ private:
     );
 
 
-    // Worker 전용 PRNG
     std::uint64_t nextRandom(
         std::size_t workerId
     );
@@ -189,6 +185,10 @@ public:
 
 
     std::size_t pendingTaskCount();
+
+
+    // 실제 전역 Queue Task 수
+    std::size_t queuedTaskCount() const;
 
 
     CoreSchedulerStatistics

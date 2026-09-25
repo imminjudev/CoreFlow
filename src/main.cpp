@@ -8,9 +8,6 @@
 #include "runtime/CoreThreadPool.hpp"
 
 
-// ---------------------------------------------------------
-// SingleRunResult
-// ---------------------------------------------------------
 struct SingleRunResult
 {
     double elapsedMs;
@@ -21,9 +18,6 @@ struct SingleRunResult
 };
 
 
-// ---------------------------------------------------------
-// BenchmarkResult
-// ---------------------------------------------------------
 struct BenchmarkResult
 {
     std::size_t workerCount;
@@ -42,25 +36,16 @@ struct BenchmarkResult
 
     double averageAttempts;
 
-    double averageSuccessfulProbes;
-
     double averageFailedRounds;
 
+    double averageSkippedScans;
 
-    // Steal 1회 성공에 필요한
-    // 평균 Victim Probe 수
     double successfulSearchDepth;
 
-
-    // 전체 Queue Probe 중
-    // 실제 Steal 성공 비율
     double stealSuccessRate;
 };
 
 
-// ---------------------------------------------------------
-// Steal Policy 이름
-// ---------------------------------------------------------
 const char* policyName(
     StealPolicy policy
 )
@@ -79,7 +64,7 @@ const char* policyName(
 
 
 // ---------------------------------------------------------
-// Benchmark 한 번 실행
+// Benchmark 1회
 // ---------------------------------------------------------
 SingleRunResult runSingleBenchmark(
     std::size_t workerCount,
@@ -119,6 +104,25 @@ SingleRunResult runSingleBenchmark(
             std::cout
                 << "[ERROR] Task submission failed\n";
         }
+    }
+
+
+    // Barrier가 닫혀 있으므로
+    // 아직 Worker가 Task를 꺼낼 수 없다.
+    //
+    // 따라서 여기서는 queuedTasks == taskCount여야 한다.
+    if (
+        pool.queuedTaskCount()
+        != workload.taskCount()
+    )
+    {
+        std::cout
+            << "[ERROR] Initial queued task count mismatch! "
+            << "expected="
+            << workload.taskCount()
+            << " actual="
+            << pool.queuedTaskCount()
+            << '\n';
     }
 
 
@@ -163,17 +167,31 @@ SingleRunResult runSingleBenchmark(
         pool.computeChecksum();
 
 
+    // 모든 Task가 정확히 실행됐는지 검사
     if (
         result.statistics.executedTasks
         != workload.taskCount()
     )
     {
         std::cout
-            << "[ERROR] Task count mismatch! "
+            << "[ERROR] Executed Task count mismatch! "
             << "expected="
             << workload.taskCount()
             << " actual="
             << result.statistics.executedTasks
+            << '\n';
+    }
+
+
+    // 실행 종료 후 Queue Task는 0이어야 한다.
+    if (
+        pool.queuedTaskCount()
+        != 0
+    )
+    {
+        std::cout
+            << "[ERROR] Queued tasks remain! "
+            << pool.queuedTaskCount()
             << '\n';
     }
 
@@ -183,7 +201,7 @@ SingleRunResult runSingleBenchmark(
 
 
 // ---------------------------------------------------------
-// 동일 조건 반복 실행
+// 반복 Benchmark
 // ---------------------------------------------------------
 BenchmarkResult runBenchmark(
     std::size_t workerCount,
@@ -228,6 +246,10 @@ BenchmarkResult runBenchmark(
 
 
     std::size_t totalFailedRounds =
+        0;
+
+
+    std::size_t totalSkippedScans =
         0;
 
 
@@ -279,6 +301,12 @@ BenchmarkResult runBenchmark(
             runResult
                 .statistics
                 .failedStealRounds;
+
+
+        totalSkippedScans +=
+            runResult
+                .statistics
+                .stealSkippedNoQueuedWork;
 
 
         if (run == 0)
@@ -362,14 +390,19 @@ BenchmarkResult runBenchmark(
                    .statistics
                    .stealAttempts
 
-            << " | search depth = "
+            << " | depth = "
             << std::setprecision(2)
             << searchDepth
 
-            << " | failed rounds = "
+            << " | failed = "
             << runResult
                    .statistics
                    .failedStealRounds
+
+            << " | skipped = "
+            << runResult
+                   .statistics
+                   .stealSkippedNoQueuedWork
 
             << '\n';
     }
@@ -411,9 +444,9 @@ BenchmarkResult runBenchmark(
         );
 
 
-    result.averageSuccessfulProbes =
+    result.averageFailedRounds =
         static_cast<double>(
-            totalSuccessfulProbes
+            totalFailedRounds
         )
         /
         static_cast<double>(
@@ -421,9 +454,9 @@ BenchmarkResult runBenchmark(
         );
 
 
-    result.averageFailedRounds =
+    result.averageSkippedScans =
         static_cast<double>(
-            totalFailedRounds
+            totalSkippedScans
         )
         /
         static_cast<double>(
@@ -472,8 +505,7 @@ BenchmarkResult runBenchmark(
 
     if (checksumSink == 0)
     {
-        // CPU 계산 결과는 atomic sink에도 저장되어 있으므로
-        // Benchmark correctness 판단에는 사용하지 않는다.
+        // Benchmark correctness 판단에는 사용하지 않음.
     }
 
 
@@ -497,13 +529,14 @@ void printResultTable(
         << "Steals    "
         << "Attempts   "
         << "Depth     "
-        << "FailRounds   "
+        << "Failed    "
+        << "Skipped   "
         << "Success(%)"
         << '\n';
 
 
     std::cout
-        << "--------------------------------------------------------------------------------\n";
+        << "----------------------------------------------------------------------------------------\n";
 
 
     for (
@@ -538,8 +571,11 @@ void printResultTable(
             << std::setw(10)
             << results[i].successfulSearchDepth
 
-            << std::setw(13)
+            << std::setw(10)
             << results[i].averageFailedRounds
+
+            << std::setw(10)
+            << results[i].averageSkippedScans
 
             << results[i].stealSuccessRate
 
@@ -549,7 +585,7 @@ void printResultTable(
 
 
 // ---------------------------------------------------------
-// 직접 비교
+// Sequential vs RandomStart 비교
 // ---------------------------------------------------------
 void printComparison(
     BenchmarkResult* sequential,
@@ -565,14 +601,15 @@ void printComparison(
         << "Workers   "
         << "Seq(ms)       "
         << "Random(ms)    "
-        << "Random Gain   "
+        << "Seq Attempts   "
+        << "Rnd Attempts   "
         << "Seq Depth   "
-        << "Random Depth"
+        << "Rnd Depth"
         << '\n';
 
 
     std::cout
-        << "-----------------------------------------------------------------------\n";
+        << "--------------------------------------------------------------------------------\n";
 
 
     for (
@@ -581,12 +618,6 @@ void printComparison(
         i++
     )
     {
-        double randomGain =
-            sequential[i].averageMs
-            /
-            randomStart[i].averageMs;
-
-
         std::cout
             << std::left
 
@@ -601,12 +632,14 @@ void printComparison(
             << std::setw(14)
             << randomStart[i].averageMs
 
-            << std::setw(14)
-            << std::setprecision(3)
-            << randomGain
+            << std::setw(15)
+            << std::setprecision(2)
+            << sequential[i].averageAttempts
+
+            << std::setw(15)
+            << randomStart[i].averageAttempts
 
             << std::setw(12)
-            << std::setprecision(2)
             << sequential[i].successfulSearchDepth
 
             << randomStart[i].successfulSearchDepth
@@ -622,7 +655,7 @@ void printComparison(
 int main()
 {
     std::cout
-        << "=== CoreFlow v0.17 Victim Selection Benchmark ===\n\n";
+        << "=== CoreFlow v0.18 Queued Task Awareness ===\n\n";
 
 
     BenchmarkWorkload workload(
@@ -650,7 +683,6 @@ int main()
         << "\n\n";
 
 
-    // 1 Worker에서는 Victim Selection 자체가 없으므로 제외.
     const std::size_t workerCounts[] =
     {
         2,
@@ -664,7 +696,6 @@ int main()
         / sizeof(workerCounts[0]);
 
 
-    // 비교 실험이므로 기존보다 5회 반복
     constexpr std::size_t runCount =
         5;
 
@@ -713,7 +744,7 @@ int main()
 
 
     // -----------------------------------------------------
-    // Random Start
+    // RandomStart
     // -----------------------------------------------------
     std::cout
         << "===== Random-Start Victim Search =====\n\n";
@@ -746,7 +777,7 @@ int main()
 
 
     std::cout
-        << "=== Victim Selection Results ===\n";
+        << "=== Queued Awareness Results ===\n";
 
 
     printResultTable(
