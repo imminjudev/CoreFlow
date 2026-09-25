@@ -21,6 +21,7 @@ add_executable(CoreFlow
     src/core/CoreWorkSignal.hpp
     src/core/CoreStartBarrier.hpp
     src/benchmark/BenchmarkWorkload.hpp
+    src/benchmark/TaskGranularWorkload.hpp
 )
 
 target_include_directories(CoreFlow PRIVATE
