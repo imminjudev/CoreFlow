@@ -5,8 +5,13 @@
 #include <thread>
 
 
+// ---------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------
 CoreThreadPool::CoreThreadPool(
     std::size_t workerCount,
+    SchedulingMode mode,
+    StealPolicy stealPolicy,
     bool verbose
 )
     : m_workers(nullptr),
@@ -14,6 +19,8 @@ CoreThreadPool::CoreThreadPool(
       m_nextWorker(0),
       m_started(false),
       m_verbose(verbose),
+      m_mode(mode),
+      m_stealPolicy(stealPolicy),
       m_remainingTasks(0),
       m_shutdownRequested(false),
       m_startBarrier(workerCount),
@@ -33,11 +40,42 @@ CoreThreadPool::CoreThreadPool(
         {
             m_workers[i].id =
                 i;
+
+
+            // -------------------------------------------------
+            // Worker별 deterministic seed
+            //
+            // 같은 Worker ID라도 0이 아닌 서로 다른
+            // 초기 상태를 가지도록 만든다.
+            // -------------------------------------------------
+            std::uint64_t seed =
+                0x9E3779B97F4A7C15ULL
+                ^
+                (
+                    static_cast<std::uint64_t>(
+                        i + 1
+                    )
+                    *
+                    0xD1B54A32D192ED03ULL
+                );
+
+
+            if (seed == 0)
+            {
+                seed = 1;
+            }
+
+
+            m_workers[i].randomState =
+                seed;
         }
     }
 }
 
 
+// ---------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------
 CoreThreadPool::~CoreThreadPool()
 {
     if (m_started)
@@ -58,8 +96,6 @@ CoreThreadPool::~CoreThreadPool()
 
 // ---------------------------------------------------------
 // submit
-//
-// Round-Robin Task Distribution
 // ---------------------------------------------------------
 bool CoreThreadPool::submit(
     const Task& task
@@ -96,6 +132,8 @@ bool CoreThreadPool::submit(
     }
 
 
+    // Queue에 Task를 공개하기 전에
+    // 미완료 Task 수를 먼저 증가.
     m_remainingTasks.fetch_add(1);
 
 
@@ -239,7 +277,51 @@ void CoreThreadPool::wait()
 
 
 // ---------------------------------------------------------
+// nextRandom
+//
+// xorshift64*
+//
+// std::random을 사용하지 않고
+// Worker별 PRNG를 직접 구현한다.
+// ---------------------------------------------------------
+std::uint64_t
+CoreThreadPool::nextRandom(
+    std::size_t workerId
+)
+{
+    std::uint64_t value =
+        m_workers[workerId]
+            .randomState;
+
+
+    value ^=
+        value >> 12;
+
+
+    value ^=
+        value << 25;
+
+
+    value ^=
+        value >> 27;
+
+
+    m_workers[workerId].randomState =
+        value;
+
+
+    return
+        value
+        *
+        2685821657736338717ULL;
+}
+
+
+// ---------------------------------------------------------
 // trySteal
+//
+// 현재 StealPolicy에 맞는
+// Victim Selection 알고리즘을 호출한다.
 // ---------------------------------------------------------
 bool CoreThreadPool::trySteal(
     std::size_t thiefId,
@@ -253,8 +335,53 @@ bool CoreThreadPool::trySteal(
     }
 
 
+    if (
+        m_stealPolicy
+        == StealPolicy::RandomStart
+    )
+    {
+        return
+            tryStealRandomStart(
+                thiefId,
+                task,
+                victimId
+            );
+    }
+
+
+    return
+        tryStealSequential(
+            thiefId,
+            task,
+            victimId
+        );
+}
+
+
+// ---------------------------------------------------------
+// Sequential Victim Search
+//
+// thiefId 다음 Worker부터 고정된 순서로 탐색.
+//
+// 예:
+//
+// thief = 3
+// workers = 8
+//
+// 4 -> 5 -> 6 -> 7 -> 0 -> 1 -> 2
+// ---------------------------------------------------------
+bool CoreThreadPool::tryStealSequential(
+    std::size_t thiefId,
+    Task& task,
+    std::size_t& victimId
+)
+{
     WorkerState& thief =
         m_workers[thiefId];
+
+
+    std::size_t probesThisRound =
+        0;
 
 
     for (
@@ -266,6 +393,9 @@ bool CoreThreadPool::trySteal(
         std::size_t candidate =
             (thiefId + offset)
             % m_workerCount;
+
+
+        probesThisRound++;
 
 
         thief
@@ -288,9 +418,139 @@ bool CoreThreadPool::trySteal(
                 .stolenTasks++;
 
 
+            // 성공한 탐색이 몇 번의 Probe를 필요로 했는지 기록
+            thief
+                .statistics
+                .successfulStealProbes
+                += probesThisRound;
+
+
             return true;
         }
     }
+
+
+    // 모든 Victim을 확인했지만 실패
+    thief
+        .statistics
+        .failedStealRounds++;
+
+
+    return false;
+}
+
+
+// ---------------------------------------------------------
+// Random-Start Victim Search
+//
+// Victim 전체를 무작위 중복 방식으로 찍는 것이 아니라,
+// "첫 번째 Victim"만 Random하게 정한다.
+//
+// 이후에는 원형 순서로 모든 Victim을 정확히 한 번씩
+// 검사할 수 있다.
+//
+// 따라서 Sequential과 동일하게
+// 최악의 경우 모든 Victim을 검사한다.
+// ---------------------------------------------------------
+bool CoreThreadPool::tryStealRandomStart(
+    std::size_t thiefId,
+    Task& task,
+    std::size_t& victimId
+)
+{
+    WorkerState& thief =
+        m_workers[thiefId];
+
+
+    const std::size_t victimCount =
+        m_workerCount - 1;
+
+
+    // -----------------------------------------------------
+    // offset 후보:
+    //
+    // 1 ~ workerCount - 1
+    //
+    // Random 값으로 이 목록의 시작 위치를 고른다.
+    // -----------------------------------------------------
+    std::size_t startIndex =
+        static_cast<std::size_t>(
+            nextRandom(thiefId)
+            % victimCount
+        );
+
+
+    std::size_t probesThisRound =
+        0;
+
+
+    for (
+        std::size_t probe = 0;
+        probe < victimCount;
+        probe++
+    )
+    {
+        // 0 ~ victimCount-1
+        std::size_t offsetIndex =
+            (
+                startIndex
+                +
+                probe
+            )
+            % victimCount;
+
+
+        // 실제 Worker offset은 1부터 시작
+        std::size_t offset =
+            offsetIndex + 1;
+
+
+        std::size_t candidate =
+            (
+                thiefId
+                +
+                offset
+            )
+            % m_workerCount;
+
+
+        probesThisRound++;
+
+
+        thief
+            .statistics
+            .stealAttempts++;
+
+
+        if (
+            m_workers[candidate]
+                .localQueue
+                .tryPopFront(task)
+        )
+        {
+            victimId =
+                candidate;
+
+
+            thief
+                .statistics
+                .stolenTasks++;
+
+
+            thief
+                .statistics
+                .successfulStealProbes
+                += probesThisRound;
+
+
+            return true;
+        }
+    }
+
+
+    thief
+        .statistics
+        .failedStealRounds++;
 
 
     return false;
@@ -338,15 +598,24 @@ void CoreThreadPool::workerLoop(
         Task task{};
 
 
-        // 자기 Local Queue의 Back에서 가져온다.
+        // -------------------------------------------------
+        // 1. 자신의 Queue
+        // -------------------------------------------------
         bool hasTask =
             worker
                 .localQueue
                 .tryPopBack(task);
 
 
-        // 자기 일이 없다면 Steal
-        if (!hasTask)
+        // -------------------------------------------------
+        // 2. Work Stealing
+        // -------------------------------------------------
+        if (
+            !hasTask
+            &&
+            m_mode
+                == SchedulingMode::WorkStealing
+        )
         {
             std::size_t victimId =
                 0;
@@ -379,7 +648,9 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // Task 실행
+        // -------------------------------------------------
+        // 3. Task 실행
+        // -------------------------------------------------
         if (hasTask)
         {
             executeTask(
@@ -411,7 +682,9 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // 모든 Task 완료
+        // -------------------------------------------------
+        // 4. 종료 조건
+        // -------------------------------------------------
         if (
             m_shutdownRequested.load()
             &&
@@ -422,7 +695,9 @@ void CoreThreadPool::workerLoop(
         }
 
 
-        // Idle -> Sleep
+        // -------------------------------------------------
+        // 5. Idle Sleep
+        // -------------------------------------------------
         worker
             .statistics
             .sleepCount++;
@@ -458,8 +733,6 @@ void CoreThreadPool::workerLoop(
 
 // ---------------------------------------------------------
 // executeTask
-//
-// TaskType에 따라 실제 실행 방식을 결정한다.
 // ---------------------------------------------------------
 void CoreThreadPool::executeTask(
     std::size_t workerId,
@@ -479,11 +752,6 @@ void CoreThreadPool::executeTask(
     }
 
 
-    // -----------------------------------------------------
-    // Sleep Task
-    //
-    // CPU 계산을 하지 않고 일정 시간 Waiting.
-    // -----------------------------------------------------
     if (
         task.type
         == TaskType::Sleep
@@ -495,12 +763,6 @@ void CoreThreadPool::executeTask(
             )
         );
     }
-
-    // -----------------------------------------------------
-    // Compute Task
-    //
-    // 실제 CPU 계산 수행.
-    // -----------------------------------------------------
     else if (
         task.type
         == TaskType::Compute
@@ -512,12 +774,6 @@ void CoreThreadPool::executeTask(
             );
 
 
-        // 결과를 실제 observable state에 반영한다.
-        //
-        // relaxed:
-        // 이 값은 Thread Synchronization 용도가 아니라
-        // 계산 제거 방지 목적이므로 강한 memory ordering이
-        // 필요하지 않다.
         m_computeSink.fetch_xor(
             result,
             std::memory_order_relaxed
@@ -540,16 +796,7 @@ void CoreThreadPool::executeTask(
 
 
 // ---------------------------------------------------------
-// executeComputeKernel
-//
-// CPU-Bound Synthetic Workload.
-//
-// 이전 계산 결과를 다음 계산이 계속 사용하기 때문에
-// 단순한 독립 반복보다 실제 CPU 계산 부하를 만든다.
-//
-// 최종 결과가 m_computeSink에서 사용되므로
-// Release Optimization에서도 전체 계산을
-// 제거할 수 없다.
+// CPU Compute Kernel
 // ---------------------------------------------------------
 std::uint64_t
 CoreThreadPool::executeComputeKernel(
@@ -570,7 +817,6 @@ CoreThreadPool::executeComputeKernel(
         i++
     )
     {
-        // xorshift 기반 정수 연산
         value ^=
             value >> 12;
 
@@ -650,6 +896,14 @@ CoreThreadPool::getStatistics() const
             stats.stealAttempts;
 
 
+        total.successfulStealProbes +=
+            stats.successfulStealProbes;
+
+
+        total.failedStealRounds +=
+            stats.failedStealRounds;
+
+
         total.sleepCount +=
             stats.sleepCount;
 
@@ -689,31 +943,43 @@ void CoreThreadPool::printStatistics() const
 
 
         std::cout
-            << "  Executed Tasks : "
+            << "  Executed Tasks          : "
             << stats.executedTasks
             << '\n';
 
 
         std::cout
-            << "  Stolen Tasks   : "
+            << "  Stolen Tasks            : "
             << stats.stolenTasks
             << '\n';
 
 
         std::cout
-            << "  Steal Attempts : "
+            << "  Steal Attempts          : "
             << stats.stealAttempts
             << '\n';
 
 
         std::cout
-            << "  Sleep Count    : "
+            << "  Successful Steal Probes : "
+            << stats.successfulStealProbes
+            << '\n';
+
+
+        std::cout
+            << "  Failed Steal Rounds     : "
+            << stats.failedStealRounds
+            << '\n';
+
+
+        std::cout
+            << "  Sleep Count             : "
             << stats.sleepCount
             << '\n';
 
 
         std::cout
-            << "  Wake Count     : "
+            << "  Wake Count              : "
             << stats.wakeCount
             << '\n';
     }
@@ -728,38 +994,50 @@ void CoreThreadPool::printStatistics() const
 
 
     std::cout
-        << "Executed Tasks : "
+        << "Executed Tasks          : "
         << total.executedTasks
         << '\n';
 
 
     std::cout
-        << "Stolen Tasks   : "
+        << "Stolen Tasks            : "
         << total.stolenTasks
         << '\n';
 
 
     std::cout
-        << "Steal Attempts : "
+        << "Steal Attempts          : "
         << total.stealAttempts
         << '\n';
 
 
     std::cout
-        << "Sleep Count    : "
+        << "Successful Steal Probes : "
+        << total.successfulStealProbes
+        << '\n';
+
+
+    std::cout
+        << "Failed Steal Rounds     : "
+        << total.failedStealRounds
+        << '\n';
+
+
+    std::cout
+        << "Sleep Count             : "
         << total.sleepCount
         << '\n';
 
 
     std::cout
-        << "Wake Count     : "
+        << "Wake Count              : "
         << total.wakeCount
         << '\n';
 }
 
 
 // ---------------------------------------------------------
-// Compute 결과 확인용
+// Compute Checksum
 // ---------------------------------------------------------
 std::uint64_t
 CoreThreadPool::computeChecksum() const
